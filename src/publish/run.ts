@@ -1,7 +1,7 @@
 import { config as loadEnv } from "dotenv";
 import { getCacheDest, listTransferChunks } from "../cache.js";
-import { resolveRpcUrl, resolveSqdUrl, supportedChains } from "../chains.js";
-import { findBlockByTimestamp } from "../evm.js";
+import { resolveRpcUrl, resolveRpcUrls, resolveSqdUrl, supportedChains } from "../chains.js";
+import { findBlockByTimestamp, probeRpcUrl } from "../evm.js";
 import { logLine } from "../log.js";
 import { publishTransfersWithProcessor } from "../processor-cache.js";
 import { loadDxTokenListTargets, defaultDxTokenListRoot } from "../token-list.js";
@@ -104,15 +104,66 @@ const resolveTransferFilterMode = (chain: Chain): TransferFilterMode => {
 
 const resolveDxTokenListRoot = () => process.env.DX_TOKEN_LIST_ROOT || defaultDxTokenListRoot;
 
+const errorMessage = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
+
+const isCacheAccessDenied = (error: unknown) => {
+  const message = errorMessage(error);
+  const code =
+    error && typeof error === "object" && "Code" in error ? String(error.Code) : undefined;
+
+  return code === "AccessDenied" || /accessdenied|not entitled|403 forbidden/i.test(message);
+};
+
+const resolveWorkingRpcUrl = async (chain: Chain) => {
+  const candidates = resolveRpcUrls(chain);
+  const failures: string[] = [];
+
+  for (const rpcUrl of candidates) {
+    try {
+      await probeRpcUrl(rpcUrl);
+
+      if (rpcUrl !== resolveRpcUrl(chain)) {
+        logLine("selected rpc fallback", {
+          chain,
+          rpc_url: rpcUrl,
+        });
+      }
+
+      return rpcUrl;
+    } catch (error) {
+      failures.push(`${rpcUrl}: ${errorMessage(error)}`);
+    }
+  }
+
+  throw new Error(`no usable RPC URL for ${chain}; ${failures.join(" | ")}`);
+};
+
 const startBlockFromCache = async ({
+  chain,
   cacheDest,
   fromBlock,
 }: {
+  chain: Chain;
   cacheDest: string;
   fromBlock: number;
 }) => {
-  const latestChunk = (await listTransferChunks({ cacheDest })).at(-1);
-  return Math.max(fromBlock, latestChunk === undefined ? fromBlock : latestChunk.toBlock + 1);
+  try {
+    const latestChunk = (await listTransferChunks({ cacheDest })).at(-1);
+    return Math.max(fromBlock, latestChunk === undefined ? fromBlock : latestChunk.toBlock + 1);
+  } catch (error) {
+    if (!isCacheAccessDenied(error)) {
+      throw error;
+    }
+
+    logLine("skipped cache resume lookup", {
+      chain,
+      cache_dest: cacheDest,
+      error: errorMessage(error),
+    });
+
+    return fromBlock;
+  }
 };
 
 export const loadPublishTargetsByChain = async (chains: Chain[]) => {
@@ -135,7 +186,7 @@ export const loadPublishTargetsByChain = async (chains: Chain[]) => {
 
 export const runChainPublish = async (chain: Chain) => {
   const sqdUrl = resolveSqdUrl(chain);
-  const rpcUrl = resolveRpcUrl(chain);
+  const rpcUrl = await resolveWorkingRpcUrl(chain);
   const cacheDest = getCacheDest(chain);
   const latestHeightText = await fetch(`${sqdUrl}/height`).then(async (response) => {
     if (!response.ok) {
@@ -152,6 +203,7 @@ export const runChainPublish = async (chain: Chain) => {
   });
   const toBlock = resolveToBlock(chain, latestHeight);
   const startBlock = await startBlockFromCache({
+    chain,
     cacheDest,
     fromBlock,
   });

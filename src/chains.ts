@@ -5,6 +5,7 @@ type ChainConfig = {
   tokenListFile: string;
   sqdUrl?: string;
   rpcUrl?: string;
+  rpcFallbackUrls?: string[];
   rpcEnv: string;
   sqdEnv: string;
 };
@@ -38,7 +39,8 @@ const configs: ChainConfig[] = [
     chain: "optimism",
     tokenListFile: "optimism-tokens.csv",
     sqdUrl: "https://v2.archive.subsquid.io/network/optimism-mainnet",
-    rpcUrl: "https://optimism-rpc.publicnode.com",
+    rpcUrl: "https://mainnet.optimism.io",
+    rpcFallbackUrls: ["https://optimism-rpc.publicnode.com"],
     rpcEnv: "RPC_OPTIMISM_HTTP",
     sqdEnv: "SQD_OPTIMISM_URL",
   },
@@ -110,6 +112,27 @@ export const resolveRpcUrl = (
   return requireValue(
     env[config.rpcEnv] || config.rpcUrl,
     `missing RPC URL for ${chain}; set --rpc-url or ${config.rpcEnv}`,
+  );
+};
+
+export const resolveRpcUrls = (
+  chain: Chain,
+  override?: string,
+  env: NodeJS.ProcessEnv = process.env,
+) => {
+  if (override) {
+    return [override];
+  }
+
+  const config = getChainConfig(chain);
+  const configured = env[config.rpcEnv];
+
+  if (configured) {
+    return [configured];
+  }
+
+  return [config.rpcUrl, ...(config.rpcFallbackUrls ?? [])].filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
   );
 };
 

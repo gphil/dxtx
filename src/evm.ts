@@ -165,6 +165,10 @@ const toHexBlockTag = (blockNumber: number) => `0x${blockNumber.toString(16)}`;
 
 const parseHexNumber = (value: string) => Number.parseInt(value, 16);
 
+export const probeRpcUrl = async (rpcUrl: string) => {
+  await fetchRpcMethod<string>(rpcUrl, "eth_chainId", []);
+};
+
 export const fetchBlock = async (blockNumber: number, rpcUrl: string) => {
   const block = await fetchRpcMethod<RpcBlock>(rpcUrl, "eth_getBlockByNumber", [
     toHexBlockTag(blockNumber),
