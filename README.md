@@ -32,6 +32,12 @@ Run one chain:
 CACHE_FROM_DATE=2026-01-01 sqd process:base
 ```
 
+Check that transfer data is landing in the cache:
+
+```bash
+npm run check:dataflow -- base
+```
+
 If you are not using the `sqd` CLI, the built node entrypoints are:
 
 ```bash

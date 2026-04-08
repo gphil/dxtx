@@ -10,6 +10,7 @@ import {
   S3Client,
 } from "@aws-sdk/client-s3";
 import { normalizeAddress } from "./format.js";
+import { logLine } from "./log.js";
 import type { Chain, TransferChunk } from "./types.js";
 
 const normalizeNetwork = (network: string) => network.trim().toLowerCase();
@@ -115,31 +116,50 @@ const createS3ClientFromEnv = (env: NodeJS.ProcessEnv) => {
   });
 };
 
-const createS3ClientConfigFromEnv = (env: NodeJS.ProcessEnv) => {
-  const endpointValue = assertEnv(env.CACHE_S3_ENDPOINT, "CACHE_S3_ENDPOINT");
-  const region = assertEnv(env.CACHE_S3_REGION, "CACHE_S3_REGION");
-  const accessKeyId = assertEnv(env.CACHE_S3_ACCESS_KEY_ID, "CACHE_S3_ACCESS_KEY_ID");
-  const secretAccessKey = assertEnv(env.CACHE_S3_SECRET_ACCESS_KEY, "CACHE_S3_SECRET_ACCESS_KEY");
-  const sessionToken = env.CACHE_S3_SESSION_TOKEN;
-  const endpoint = /^[a-z]+:\/\//i.test(endpointValue) ? endpointValue : `https://${endpointValue}`;
-  const forcePathStyle =
-    env.CACHE_S3_FORCE_PATH_STYLE ? env.CACHE_S3_FORCE_PATH_STYLE !== "false" : true;
-
-  return {
-    endpoint,
-    region,
-    forcePathStyle,
-    credentials: {
-      accessKeyId,
-      secretAccessKey,
-      ...(sessionToken ? { sessionToken } : {}),
-    },
-  };
-};
-
 const isDir = (value: string) => value.endsWith("/");
 const toDir = (value: string) => (isDir(value) ? value : `${value}/`);
 const toS3Url = (bucket: string, dir: string) => new URL(dir, `s3://${bucket}`).toString();
+const normalizeErrorMessage = (value: unknown) =>
+  value instanceof Error ? value.message : typeof value === "string" ? value : "unknown error";
+
+const isAwsError = (value: unknown): value is {
+  name?: string;
+  message?: string;
+  Code?: string;
+  $metadata?: { httpStatusCode?: number };
+} => typeof value === "object" && value !== null;
+
+const createS3Error = (
+  operation: string,
+  context: Record<string, string | number | undefined>,
+  error: unknown,
+) => {
+  const fields = Object.entries(context)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(" ");
+  const status = isAwsError(error) ? error.$metadata?.httpStatusCode : undefined;
+  const code = isAwsError(error) ? error.Code ?? error.name : undefined;
+  const message = normalizeErrorMessage(error);
+  return new Error(
+    [`s3 ${operation} failed`, fields, status ? `status=${status}` : "", code ? `code=${code}` : "", `error=${message}`]
+      .filter(Boolean)
+      .join(" "),
+    { cause: error instanceof Error ? error : undefined },
+  );
+};
+
+const withS3Context = async <T>(
+  operation: string,
+  context: Record<string, string | number | undefined>,
+  thunk: () => Promise<T>,
+) => {
+  try {
+    return await thunk();
+  } catch (error) {
+    throw createS3Error(operation, context, error);
+  }
+};
 
 class CompatibleS3Dest implements Dest {
   private bucket: string;
@@ -161,16 +181,24 @@ class CompatibleS3Dest implements Dest {
   }
 
   private async listKeys(prefix: string, delimiter?: string, maxKeys?: number) {
-    const response = await this.client.send(
-      new ListObjectsV2Command({
-        Bucket: this.bucket,
-        Prefix: prefix,
-        ...(delimiter ? { Delimiter: delimiter } : {}),
-        ...(maxKeys ? { MaxKeys: maxKeys } : {}),
-      }),
+    return withS3Context(
+      "list",
+      {
+        bucket: this.bucket,
+        prefix,
+        delimiter,
+        max_keys: maxKeys,
+      },
+      () =>
+        this.client.send(
+          new ListObjectsV2Command({
+            Bucket: this.bucket,
+            Prefix: prefix,
+            ...(delimiter ? { Delimiter: delimiter } : {}),
+            ...(maxKeys ? { MaxKeys: maxKeys } : {}),
+          }),
+        ),
     );
-
-    return response;
   }
 
   private async existsFile(name: string) {
@@ -195,11 +223,17 @@ class CompatibleS3Dest implements Dest {
   }
 
   async readFile(name: string) {
-    const response = await this.client.send(
-      new GetObjectCommand({
-        Bucket: this.bucket,
-        Key: this.key(name),
-      }),
+    const key = this.key(name);
+    const response = await withS3Context(
+      "read",
+      { bucket: this.bucket, key },
+      () =>
+        this.client.send(
+          new GetObjectCommand({
+            Bucket: this.bucket,
+            Key: key,
+          }),
+        ),
     );
 
     if (!response.Body) {
@@ -210,22 +244,34 @@ class CompatibleS3Dest implements Dest {
   }
 
   async writeFile(name: string, data: string | Uint8Array) {
-    await this.client.send(
-      new PutObjectCommand({
-        Bucket: this.bucket,
-        Key: this.key(name),
-        Body: typeof data === "string" ? Buffer.from(data, "utf8") : data,
-      }),
+    const key = this.key(name);
+    await withS3Context(
+      "write",
+      { bucket: this.bucket, key },
+      () =>
+        this.client.send(
+          new PutObjectCommand({
+            Bucket: this.bucket,
+            Key: key,
+            Body: typeof data === "string" ? Buffer.from(data, "utf8") : data,
+          }),
+        ),
     );
   }
 
   async mkdir(name: string) {
-    await this.client.send(
-      new PutObjectCommand({
-        Bucket: this.bucket,
-        Key: this.key(toDir(name)),
-        Body: new Uint8Array(),
-      }),
+    const key = this.key(toDir(name));
+    await withS3Context(
+      "mkdir",
+      { bucket: this.bucket, key },
+      () =>
+        this.client.send(
+          new PutObjectCommand({
+            Bucket: this.bucket,
+            Key: key,
+            Body: new Uint8Array(),
+          }),
+        ),
     );
   }
 
@@ -241,13 +287,23 @@ class CompatibleS3Dest implements Dest {
     let continuationToken: string | undefined;
 
     do {
-      const response = await this.client.send(
-        new ListObjectsV2Command({
-          Bucket: this.bucket,
-          Prefix: prefix,
-          Delimiter: "/",
-          ContinuationToken: continuationToken,
-        }),
+      const response = await withS3Context(
+        "list",
+        {
+          bucket: this.bucket,
+          prefix,
+          delimiter: "/",
+          continuation: continuationToken,
+        },
+        () =>
+          this.client.send(
+            new ListObjectsV2Command({
+              Bucket: this.bucket,
+              Prefix: prefix,
+              Delimiter: "/",
+              ContinuationToken: continuationToken,
+            }),
+          ),
       );
 
       (response.CommonPrefixes ?? []).forEach((item) => {
@@ -282,14 +338,19 @@ class CompatibleS3Dest implements Dest {
       return;
     }
 
-    await this.client.send(
-      new DeleteObjectsCommand({
-        Bucket: this.bucket,
-        Delete: {
-          Objects: [{ Key: this.key(name) }],
-          Quiet: true,
-        },
-      }),
+    await withS3Context(
+      "delete",
+      { bucket: this.bucket, key: this.key(name), objects: 1 },
+      () =>
+        this.client.send(
+          new DeleteObjectsCommand({
+            Bucket: this.bucket,
+            Delete: {
+              Objects: [{ Key: this.key(name) }],
+              Quiet: true,
+            },
+          }),
+        ),
     );
   }
 
@@ -298,12 +359,21 @@ class CompatibleS3Dest implements Dest {
     let continuationToken: string | undefined;
 
     do {
-      const response = await this.client.send(
-        new ListObjectsV2Command({
-          Bucket: this.bucket,
-          Prefix: prefix,
-          ContinuationToken: continuationToken,
-        }),
+      const response = await withS3Context(
+        "list",
+        {
+          bucket: this.bucket,
+          prefix,
+          continuation: continuationToken,
+        },
+        () =>
+          this.client.send(
+            new ListObjectsV2Command({
+              Bucket: this.bucket,
+              Prefix: prefix,
+              ContinuationToken: continuationToken,
+            }),
+          ),
       );
 
       const objects = (response.Contents ?? [])
@@ -312,14 +382,23 @@ class CompatibleS3Dest implements Dest {
         .map((key) => ({ Key: key }));
 
       if (objects.length > 0) {
-        await this.client.send(
-          new DeleteObjectsCommand({
-            Bucket: this.bucket,
-            Delete: {
-              Objects: objects,
-              Quiet: true,
-            },
-          }),
+        await withS3Context(
+          "delete",
+          {
+            bucket: this.bucket,
+            prefix,
+            objects: objects.length,
+          },
+          () =>
+            this.client.send(
+              new DeleteObjectsCommand({
+                Bucket: this.bucket,
+                Delete: {
+                  Objects: objects,
+                  Quiet: true,
+                },
+              }),
+            ),
         );
       }
 
@@ -469,4 +548,38 @@ export const listTransferChunks = async ({
       )
       .filter((chunk) => overlapsRange(chunk, fromBlock, toBlock)),
   );
+};
+
+export const probeFileStoreDest = async ({
+  chain,
+  env = process.env,
+}: {
+  chain: Chain;
+  env?: NodeJS.ProcessEnv;
+}) => {
+  const cacheDest = getCacheDest(chain, env);
+  const transferDest = `${cacheDest.replace(/\/+$/, "")}/erc20-transfers`;
+  const dest = createFileStoreDest(transferDest, env);
+  const probeName = `_probe-${Date.now()}.txt`;
+
+  logLine("probing file-store dest", { chain, dest: transferDest });
+  const statusExists = await dest.exists("status.txt");
+  logLine("probed file-store status", { chain, exists: Number(statusExists) });
+
+  if (statusExists) {
+    const status = await dest.readFile("status.txt");
+    logLine("read file-store status", {
+      chain,
+      status: JSON.stringify(status.trim()),
+    });
+  }
+
+  const names = await dest.readdir("./");
+  logLine("listed file-store root", { chain, entries: names.length });
+  await dest.writeFile(probeName, "probe");
+  logLine("wrote file-store probe", { chain, file: probeName });
+  await dest.readFile(probeName);
+  logLine("read file-store probe", { chain, file: probeName });
+  await dest.rm(probeName);
+  logLine("removed file-store probe", { chain, file: probeName });
 };
