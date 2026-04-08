@@ -4,6 +4,7 @@ SQD file-store indexer for ERC20 transfers across the token universe from `dx-to
 
 ## Layout
 
+- `token-list/`: vendored `dx-token-list` snapshot used by default in cloud and local runs
 - `src/<chain>/publish.ts`: one long-running publisher entrypoint per chain
 - `src/all/publish.ts`: launches all selected chain publishers in parallel
 - `src/publish/run.ts`: chain setup, resume logic, metadata resolution, and processor launch
@@ -73,7 +74,7 @@ sqd process:all
 - `CACHE_TARGET_LIMIT`
   dev-only cap on how many token targets to index per chain
 - `DX_TOKEN_LIST_ROOT`
-  override the token list repo path
+  override the bundled token list snapshot path
 - `DUNE_API_KEY`
   optional token metadata source; falls back to RPC when missing or rate-limited
 

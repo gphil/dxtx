@@ -1,10 +1,12 @@
 import { readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { getChainConfig } from "./chains.js";
 import { normalizeAddress } from "./format.js";
 import type { Chain, TokenTarget } from "./types.js";
 
-export const defaultDxTokenListRoot = "../dx-token-list";
+const currentDir = dirname(fileURLToPath(import.meta.url));
+export const defaultDxTokenListRoot = join(currentDir, "..", "token-list");
 const zeroAddress = "0x0000000000000000000000000000000000000000";
 const coingeckoPlatformByChain = new Map<Chain, string>([
   ["ethereum", "ethereum"],
