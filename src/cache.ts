@@ -1,9 +1,10 @@
 import { LocalDest, type Dest } from "@subsquid/file-store";
-import { S3Dest } from "@subsquid/file-store-s3";
 import { createReadStream } from "node:fs";
 import { readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { join, posix as pathPosix } from "node:path";
 import {
+  DeleteObjectsCommand,
+  GetObjectCommand,
   ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
@@ -136,6 +137,202 @@ const createS3ClientConfigFromEnv = (env: NodeJS.ProcessEnv) => {
   };
 };
 
+const isDir = (value: string) => value.endsWith("/");
+const toDir = (value: string) => (isDir(value) ? value : `${value}/`);
+const toS3Url = (bucket: string, dir: string) => new URL(dir, `s3://${bucket}`).toString();
+
+class CompatibleS3Dest implements Dest {
+  private bucket: string;
+  private dir: string;
+
+  constructor(cacheUri: string, private client: S3Client) {
+    const { bucket, key } = parseS3Uri(cacheUri);
+    this.bucket = bucket;
+    this.dir = `/${key.replace(/^\/+/, "")}`;
+  }
+
+  path(...paths: string[]) {
+    return pathPosix.join("/", this.dir, ...paths);
+  }
+
+  private key(...paths: string[]) {
+    const key = this.path(...paths);
+    return key.startsWith("/") ? key.slice(1) : key;
+  }
+
+  private async listKeys(prefix: string, delimiter?: string, maxKeys?: number) {
+    const response = await this.client.send(
+      new ListObjectsV2Command({
+        Bucket: this.bucket,
+        Prefix: prefix,
+        ...(delimiter ? { Delimiter: delimiter } : {}),
+        ...(maxKeys ? { MaxKeys: maxKeys } : {}),
+      }),
+    );
+
+    return response;
+  }
+
+  private async existsFile(name: string) {
+    const key = this.key(name);
+    const response = await this.listKeys(key, undefined, 1);
+
+    return (response.Contents ?? []).some((item) => item.Key === key);
+  }
+
+  private async existsDir(name: string) {
+    const prefix = this.key(toDir(name));
+    const response = await this.listKeys(prefix, undefined, 1);
+    return (response.Contents ?? []).length > 0;
+  }
+
+  async exists(name: string) {
+    if (isDir(name)) {
+      return this.existsDir(name);
+    }
+
+    return (await this.existsFile(name)) || this.existsDir(name);
+  }
+
+  async readFile(name: string) {
+    const response = await this.client.send(
+      new GetObjectCommand({
+        Bucket: this.bucket,
+        Key: this.key(name),
+      }),
+    );
+
+    if (!response.Body) {
+      throw new Error(`missing S3 body for ${name}`);
+    }
+
+    return response.Body.transformToString("utf-8");
+  }
+
+  async writeFile(name: string, data: string | Uint8Array) {
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: this.key(name),
+        Body: typeof data === "string" ? Buffer.from(data, "utf8") : data,
+      }),
+    );
+  }
+
+  async mkdir(name: string) {
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: this.key(toDir(name)),
+        Body: new Uint8Array(),
+      }),
+    );
+  }
+
+  async readdir(name: string) {
+    const dir = toDir(name);
+
+    if (!(await this.exists(dir))) {
+      return [];
+    }
+
+    const prefix = this.key(dir);
+    const names = new Set<string>();
+    let continuationToken: string | undefined;
+
+    do {
+      const response = await this.client.send(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: prefix,
+          Delimiter: "/",
+          ContinuationToken: continuationToken,
+        }),
+      );
+
+      (response.CommonPrefixes ?? []).forEach((item) => {
+        const value = item.Prefix;
+
+        if (!value) {
+          return;
+        }
+
+        names.add(value.slice(prefix.length, value.length - 1));
+      });
+
+      (response.Contents ?? []).forEach((item) => {
+        const value = item.Key;
+
+        if (!value || value === prefix) {
+          return;
+        }
+
+        names.add(value.slice(prefix.length));
+      });
+
+      continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+    } while (continuationToken);
+
+    return [...names].sort();
+  }
+
+  async rm(name: string) {
+    if (isDir(name) || !(await this.existsFile(name))) {
+      await this.rmDir(name);
+      return;
+    }
+
+    await this.client.send(
+      new DeleteObjectsCommand({
+        Bucket: this.bucket,
+        Delete: {
+          Objects: [{ Key: this.key(name) }],
+          Quiet: true,
+        },
+      }),
+    );
+  }
+
+  private async rmDir(name: string) {
+    const prefix = this.key(toDir(name));
+    let continuationToken: string | undefined;
+
+    do {
+      const response = await this.client.send(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: prefix,
+          ContinuationToken: continuationToken,
+        }),
+      );
+
+      const objects = (response.Contents ?? [])
+        .map((item) => item.Key)
+        .filter((key): key is string => typeof key === "string")
+        .map((key) => ({ Key: key }));
+
+      if (objects.length > 0) {
+        await this.client.send(
+          new DeleteObjectsCommand({
+            Bucket: this.bucket,
+            Delete: {
+              Objects: objects,
+              Quiet: true,
+            },
+          }),
+        );
+      }
+
+      continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+    } while (continuationToken);
+  }
+
+  async transact(name: string, cb: (txDest: Dest) => Promise<void>) {
+    const txDest = new CompatibleS3Dest(toS3Url(this.bucket, this.path(name)), this.client);
+    await cb(txDest);
+  }
+}
+
 export const getCacheDest = (chain: Chain, env: NodeJS.ProcessEnv = process.env) =>
   env.CACHE_DEST ? withNetworkSuffix(env.CACHE_DEST, chain) : `./cache/${normalizeNetwork(chain)}`;
 
@@ -146,7 +343,7 @@ export const createFileStoreDest = (
   env: NodeJS.ProcessEnv = process.env,
 ): Dest =>
   isS3Uri(cacheUri)
-    ? new S3Dest(cacheUri, createS3ClientConfigFromEnv(env))
+    ? new CompatibleS3Dest(cacheUri, createS3ClientFromEnv(env))
     : new LocalDest(cacheUri);
 
 export const getTokenManifestPath = ({ cacheDest }: { cacheDest: string }) =>
