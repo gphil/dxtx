@@ -38,6 +38,12 @@ Check that transfer data is landing in the cache:
 npm run check:dataflow -- base
 ```
 
+Check block freshness against the current SQD archive height:
+
+```bash
+npm run check:freshness -- base
+```
+
 If you are not using the `sqd` CLI, the built node entrypoints are:
 
 ```bash

@@ -18,6 +18,7 @@
     "process:bsc": "node --require=dotenv/config lib/bsc/publish.js",
     "check:cache": "node --require=dotenv/config lib/check-cache.js",
     "check:dataflow": "node --require=dotenv/config lib/check-dataflow.js",
+    "check:freshness": "node --require=dotenv/config lib/check-freshness.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
