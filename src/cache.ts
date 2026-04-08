@@ -95,15 +95,9 @@ const sortTransferChunks = (chunks: TransferChunk[]) =>
 const createS3ClientFromEnv = (env: NodeJS.ProcessEnv) => {
   const endpointValue = assertEnv(env.CACHE_S3_ENDPOINT, "CACHE_S3_ENDPOINT");
   const region = assertEnv(env.CACHE_S3_REGION, "CACHE_S3_REGION");
-  const accessKeyId = assertEnv(
-    env.CACHE_S3_ACCESS_KEY_ID || env.AWS_ACCESS_KEY_ID,
-    "CACHE_S3_ACCESS_KEY_ID or AWS_ACCESS_KEY_ID",
-  );
-  const secretAccessKey = assertEnv(
-    env.CACHE_S3_SECRET_ACCESS_KEY || env.AWS_SECRET_ACCESS_KEY,
-    "CACHE_S3_SECRET_ACCESS_KEY or AWS_SECRET_ACCESS_KEY",
-  );
-  const sessionToken = env.CACHE_S3_SESSION_TOKEN || env.AWS_SESSION_TOKEN;
+  const accessKeyId = assertEnv(env.CACHE_S3_ACCESS_KEY_ID, "CACHE_S3_ACCESS_KEY_ID");
+  const secretAccessKey = assertEnv(env.CACHE_S3_SECRET_ACCESS_KEY, "CACHE_S3_SECRET_ACCESS_KEY");
+  const sessionToken = env.CACHE_S3_SESSION_TOKEN;
   const endpoint = /^[a-z]+:\/\//i.test(endpointValue) ? endpointValue : `https://${endpointValue}`;
   const forcePathStyle =
     env.CACHE_S3_FORCE_PATH_STYLE ? env.CACHE_S3_FORCE_PATH_STYLE !== "false" : true;
@@ -123,15 +117,9 @@ const createS3ClientFromEnv = (env: NodeJS.ProcessEnv) => {
 const createS3ClientConfigFromEnv = (env: NodeJS.ProcessEnv) => {
   const endpointValue = assertEnv(env.CACHE_S3_ENDPOINT, "CACHE_S3_ENDPOINT");
   const region = assertEnv(env.CACHE_S3_REGION, "CACHE_S3_REGION");
-  const accessKeyId = assertEnv(
-    env.CACHE_S3_ACCESS_KEY_ID || env.AWS_ACCESS_KEY_ID,
-    "CACHE_S3_ACCESS_KEY_ID or AWS_ACCESS_KEY_ID",
-  );
-  const secretAccessKey = assertEnv(
-    env.CACHE_S3_SECRET_ACCESS_KEY || env.AWS_SECRET_ACCESS_KEY,
-    "CACHE_S3_SECRET_ACCESS_KEY or AWS_SECRET_ACCESS_KEY",
-  );
-  const sessionToken = env.CACHE_S3_SESSION_TOKEN || env.AWS_SESSION_TOKEN;
+  const accessKeyId = assertEnv(env.CACHE_S3_ACCESS_KEY_ID, "CACHE_S3_ACCESS_KEY_ID");
+  const secretAccessKey = assertEnv(env.CACHE_S3_SECRET_ACCESS_KEY, "CACHE_S3_SECRET_ACCESS_KEY");
+  const sessionToken = env.CACHE_S3_SESSION_TOKEN;
   const endpoint = /^[a-z]+:\/\//i.test(endpointValue) ? endpointValue : `https://${endpointValue}`;
   const forcePathStyle =
     env.CACHE_S3_FORCE_PATH_STYLE ? env.CACHE_S3_FORCE_PATH_STYLE !== "false" : true;
