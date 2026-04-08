@@ -1,0 +1,104 @@
+{
+  "$schema": "https://cdn.subsquid.io/schemas/commands.json",
+  "commands": {
+    "clean": {
+      "description": "Delete build artifacts",
+      "cmd": ["npx", "--yes", "rimraf", "lib"]
+    },
+    "build": {
+      "description": "Build the indexer",
+      "deps": ["clean"],
+      "cmd": ["tsc", "-p", "tsconfig.json"]
+    },
+    "process:all": {
+      "description": "Load .env and start all chain publishers",
+      "deps": ["build"],
+      "cmd": ["node", "--require=dotenv/config", "lib/all/publish.js"]
+    },
+    "process:ethereum": {
+      "description": "Load .env and start the ethereum publisher",
+      "deps": ["build"],
+      "cmd": ["node", "--require=dotenv/config", "lib/ethereum/publish.js"]
+    },
+    "process:base": {
+      "description": "Load .env and start the base publisher",
+      "deps": ["build"],
+      "cmd": ["node", "--require=dotenv/config", "lib/base/publish.js"]
+    },
+    "process:arbitrum": {
+      "description": "Load .env and start the arbitrum publisher",
+      "deps": ["build"],
+      "cmd": ["node", "--require=dotenv/config", "lib/arbitrum/publish.js"]
+    },
+    "process:optimism": {
+      "description": "Load .env and start the optimism publisher",
+      "deps": ["build"],
+      "cmd": ["node", "--require=dotenv/config", "lib/optimism/publish.js"]
+    },
+    "process:polygon": {
+      "description": "Load .env and start the polygon publisher",
+      "deps": ["build"],
+      "cmd": ["node", "--require=dotenv/config", "lib/polygon/publish.js"]
+    },
+    "process:avalanche": {
+      "description": "Load .env and start the avalanche publisher",
+      "deps": ["build"],
+      "cmd": ["node", "--require=dotenv/config", "lib/avalanche/publish.js"]
+    },
+    "process:unichain": {
+      "description": "Load .env and start the unichain publisher",
+      "deps": ["build"],
+      "cmd": ["node", "--require=dotenv/config", "lib/unichain/publish.js"]
+    },
+    "process:bsc": {
+      "description": "Load .env and start the bsc publisher",
+      "deps": ["build"],
+      "cmd": ["node", "--require=dotenv/config", "lib/bsc/publish.js"]
+    },
+    "process:prod:all": {
+      "deps": ["build"],
+      "cmd": ["node", "lib/all/publish.js"],
+      "hidden": true
+    },
+    "process:prod:ethereum": {
+      "deps": ["build"],
+      "cmd": ["node", "lib/ethereum/publish.js"],
+      "hidden": true
+    },
+    "process:prod:base": {
+      "deps": ["build"],
+      "cmd": ["node", "lib/base/publish.js"],
+      "hidden": true
+    },
+    "process:prod:arbitrum": {
+      "deps": ["build"],
+      "cmd": ["node", "lib/arbitrum/publish.js"],
+      "hidden": true
+    },
+    "process:prod:optimism": {
+      "deps": ["build"],
+      "cmd": ["node", "lib/optimism/publish.js"],
+      "hidden": true
+    },
+    "process:prod:polygon": {
+      "deps": ["build"],
+      "cmd": ["node", "lib/polygon/publish.js"],
+      "hidden": true
+    },
+    "process:prod:avalanche": {
+      "deps": ["build"],
+      "cmd": ["node", "lib/avalanche/publish.js"],
+      "hidden": true
+    },
+    "process:prod:unichain": {
+      "deps": ["build"],
+      "cmd": ["node", "lib/unichain/publish.js"],
+      "hidden": true
+    },
+    "process:prod:bsc": {
+      "deps": ["build"],
+      "cmd": ["node", "lib/bsc/publish.js"],
+      "hidden": true
+    }
+  }
+}
