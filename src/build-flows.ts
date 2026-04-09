@@ -34,7 +34,7 @@ const selectedChain = (args: string[]): Chain => {
   }
 
   if (chains.length > 1) {
-    throw new Error(`build:flow-prototype currently supports one chain at a time; received ${chains.join(",")}`);
+    throw new Error(`build:flows currently supports one chain at a time; received ${chains.join(",")}`);
   }
 
   const [chain] = chains;
@@ -84,7 +84,7 @@ const sqlStringList = (values: string[]) =>
   `[${values.map((value) => `'${escapeSqlString(value)}'`).join(", ")}]`;
 
 const outputPath = (chain: Chain) =>
-  process.env.ANALYTICS_DB_PATH || `./analytics/${chain}-flow-prototype.duckdb`;
+  process.env.ANALYTICS_DB_PATH || `./analytics/${chain}-flows.duckdb`;
 
 const sourceViewSql = ({
   chain,
@@ -211,14 +211,14 @@ const summarySql = `
   from token_daily_top_flows
 `;
 
-type PrototypeSummary = {
+type FlowSummary = {
   leaderboard_rows: number;
   tokens: number;
   first_day: string;
   last_day: string;
 };
 
-const buildChainPrototype = async ({
+const buildChainFlows = async ({
   connection,
   chain,
 }: {
@@ -229,7 +229,7 @@ const buildChainPrototype = async ({
   const chunkUris = (await listTransferChunks({ cacheDest })).map((chunk) => chunk.cacheUri);
 
   if (chunkUris.length === 0) {
-    logLine("skipped flow prototype with no transfer chunks", { chain });
+    logLine("skipped flow build with no transfer chunks", { chain });
     return;
   }
 
@@ -244,9 +244,9 @@ const buildChainPrototype = async ({
   await run(connection, dailyAddressFlowsSql);
   await run(connection, dailyTopFlowsSql);
 
-  const [summary] = await rows<PrototypeSummary>(connection, summarySql);
+  const [summary] = await rows<FlowSummary>(connection, summarySql);
 
-  logLine("built flow prototype", {
+  logLine("built flows", {
     chain,
     chunks: chunkUris.length,
     leaderboard_rows: summary?.leaderboard_rows,
@@ -267,9 +267,9 @@ const main = async () => {
       await configureS3(connection, process.env);
     }
 
-    await buildChainPrototype({ connection, chain });
+    await buildChainFlows({ connection, chain });
 
-    logLine("flow prototype ready", {
+    logLine("flows ready", {
       chain,
       database: databasePath,
     });
@@ -280,6 +280,6 @@ const main = async () => {
 
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
-  logLine("build flow prototype failed", { error: message });
+  logLine("build flows failed", { error: message });
   process.exitCode = 1;
 });
