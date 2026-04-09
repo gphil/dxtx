@@ -17,6 +17,10 @@ const assertEnv = (value: string | undefined, key: string) => {
 };
 
 const envValue = (key: string) => process.env[key];
+const envFlag = (key: string) => {
+  const value = process.env[key];
+  return value === "1" || value === "true";
+};
 const parseDay = (value: string | undefined, key: string) => {
   if (value === undefined) {
     return undefined;
@@ -326,6 +330,8 @@ const createTokenDailyTopFlowsTableSql = `
   )
 `;
 
+const dropTableSql = (table: string) => `drop table if exists ${table}`;
+
 const deleteDayRangeSql = ({
   table,
   fromDay,
@@ -405,6 +411,7 @@ const buildChainFlows = async ({
 }) => {
   const cacheDest = getCacheDest(chain);
   const { fromDay, toDay } = dayRange();
+  const reset = envFlag("ANALYTICS_RESET");
   const { fromBlock, toBlock } = await resolveBlockRange({
     chain,
     fromDay,
@@ -426,11 +433,19 @@ const buildChainFlows = async ({
   logLine("starting flows build", {
     chain,
     chunks: chunkUris.length,
+    reset: reset ? 1 : undefined,
     from_day: fromDay,
     to_day: toDay,
     from_block: fromBlock,
     to_block: toBlock,
   });
+
+  if (reset) {
+    logLine("building flows stage", { chain, stage: "reset" });
+    await run(connection, dropTableSql("token_daily_top_flows"));
+    await run(connection, dropTableSql("token_daily_totals"));
+    await run(connection, dropTableSql("token_manifest"));
+  }
 
   logLine("building flows stage", { chain, stage: "manifest", chunks: chunkUris.length });
   await run(
