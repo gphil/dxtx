@@ -15,6 +15,8 @@ const assertEnv = (value: string | undefined, key: string) => {
   return value;
 };
 
+const envValue = (key: string) => process.env[key];
+
 const splitChainArgs = (values: string[]) =>
   values.flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean);
 
@@ -86,6 +88,30 @@ const sqlStringList = (values: string[]) =>
 const outputPath = (chain: Chain) =>
   process.env.ANALYTICS_DB_PATH || `./analytics/${chain}-flows.duckdb`;
 
+const tempDirectory = (chain: Chain) =>
+  process.env.ANALYTICS_TEMP_DIRECTORY || `./analytics/${chain}-duckdb-tmp`;
+
+const configureDuckDb = async ({
+  connection,
+  chain,
+}: {
+  connection: DuckDBConnection;
+  chain: Chain;
+}) => {
+  const memoryLimit = envValue("ANALYTICS_MEMORY_LIMIT") || "4GB";
+  const threads = envValue("ANALYTICS_THREADS");
+  const tempDir = tempDirectory(chain);
+
+  await mkdir(tempDir, { recursive: true });
+  await run(connection, `SET memory_limit='${escapeSqlString(memoryLimit)}'`);
+  await run(connection, `SET temp_directory='${escapeSqlString(tempDir)}'`);
+  await run(connection, "SET preserve_insertion_order=false");
+
+  if (threads) {
+    await run(connection, `SET threads=${Number.parseInt(threads, 10)}`);
+  }
+};
+
 const sourceViewSql = ({
   chain,
   chunkUris,
@@ -130,8 +156,8 @@ const dailyTokenTotalsSql = `
   group by 1, 2, 3
 `;
 
-const dailyAddressFlowsSql = `
-  create or replace table token_daily_address_flows as
+const dailyTopFlowsSql = `
+  create or replace table token_daily_top_flows as
   with senders as (
     select
       chain,
@@ -160,23 +186,22 @@ const dailyAddressFlowsSql = `
     where amount_native is not null
     group by 1, 2, 3, 4, 5
   )
-  select *
-  from senders
-  union all
-  select *
-  from recipients
-`;
-
-const dailyTopFlowsSql = `
-  create or replace table token_daily_top_flows as
-  with ranked as (
+  ,
+  flows as (
+    select *
+    from senders
+    union all
+    select *
+    from recipients
+  ),
+  ranked as (
     select
       flows.*,
       row_number() over (
         partition by chain, day, token_address, direction
         order by amount_native_sum desc, transfer_count desc, address asc
       ) as flow_rank
-    from token_daily_address_flows as flows
+    from flows
   )
   select
     ranked.chain,
@@ -233,15 +258,21 @@ const buildChainFlows = async ({
     return;
   }
 
+  logLine("building flows stage", { chain, stage: "manifest", chunks: chunkUris.length });
   await run(
     connection,
     manifestTableSql({
       manifestUri: getTokenManifestPath({ cacheDest }),
     }),
   );
+
+  logLine("building flows stage", { chain, stage: "source_view" });
   await run(connection, sourceViewSql({ chain, chunkUris }));
+
+  logLine("building flows stage", { chain, stage: "daily_totals" });
   await run(connection, dailyTokenTotalsSql);
-  await run(connection, dailyAddressFlowsSql);
+
+  logLine("building flows stage", { chain, stage: "daily_top_flows" });
   await run(connection, dailyTopFlowsSql);
 
   const [summary] = await rows<FlowSummary>(connection, summarySql);
@@ -263,6 +294,8 @@ const main = async () => {
   const connection = await createConnection(databasePath);
 
   try {
+    await configureDuckDb({ connection, chain });
+
     if (isS3Uri(getCacheDest(chain))) {
       await configureS3(connection, process.env);
     }
