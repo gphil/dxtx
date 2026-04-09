@@ -2,7 +2,8 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import { getCacheDest, getTokenManifestPath, isS3Uri, listTransferChunks } from "./cache.js";
-import { supportedChains } from "./chains.js";
+import { resolveRpcUrl, resolveSqdUrl, supportedChains } from "./chains.js";
+import { findBlockByTimestamp } from "./evm.js";
 import { escapeSqlString } from "./format.js";
 import { logLine } from "./log.js";
 import type { Chain } from "./types.js";
@@ -110,6 +111,13 @@ const dayRange = () => {
   return { fromDay, toDay };
 };
 
+const nextDay = (value: string) => {
+  const timestamp = Date.parse(`${value}T00:00:00Z`);
+  return new Date(timestamp + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+};
+
+const dayTimestamp = (value: string) => Math.floor(Date.parse(`${value}T00:00:00Z`) / 1_000);
+
 const tempDirectory = (chain: Chain) =>
   process.env.ANALYTICS_TEMP_DIRECTORY || `./analytics/${chain}-duckdb-tmp`;
 
@@ -145,7 +153,7 @@ const sourceViewSql = ({
   fromDay?: string;
   toDay?: string;
 }) => `
-  create or replace temp view source_transfers as
+  create or replace temp table source_transfers as
   select
     '${escapeSqlString(chain)}' as chain,
     cast(date_trunc('day', timezone('UTC', to_timestamp(block_timestamp))) as date) as day,
@@ -320,6 +328,58 @@ const deleteDayRangeSql = ({
       `
     : `delete from ${table}`;
 
+const resolveBlockRange = async ({
+  chain,
+  fromDay,
+  toDay,
+}: {
+  chain: Chain;
+  fromDay?: string;
+  toDay?: string;
+}) => {
+  if (!fromDay && !toDay) {
+    return {};
+  }
+
+  const rpcUrl = resolveRpcUrl(chain);
+  const sqdUrl = resolveSqdUrl(chain);
+  const latestHeight = Number.parseInt(
+    await fetch(`${sqdUrl}/height`).then(async (response) => {
+      if (!response.ok) {
+        throw new Error(`SQD error for ${chain}: ${response.status} ${response.statusText}`);
+      }
+
+      return response.text();
+    }),
+    10,
+  );
+
+  const fromBlock =
+    fromDay === undefined
+      ? undefined
+      : await findBlockByTimestamp({
+          targetTimestamp: dayTimestamp(fromDay),
+          latestBlock: latestHeight,
+          rpcUrl,
+        });
+
+  const toBlock =
+    toDay === undefined
+      ? undefined
+      : (
+          await findBlockByTimestamp({
+            targetTimestamp: dayTimestamp(nextDay(toDay)),
+            latestBlock: latestHeight,
+            rpcUrl,
+          })
+        ) - 1;
+
+  return {
+    fromBlock,
+    toBlock: toBlock === undefined ? undefined : Math.max(0, toBlock),
+  };
+};
+
 const buildChainFlows = async ({
   connection,
   chain,
@@ -328,8 +388,19 @@ const buildChainFlows = async ({
   chain: Chain;
 }) => {
   const cacheDest = getCacheDest(chain);
-  const chunkUris = (await listTransferChunks({ cacheDest })).map((chunk) => chunk.cacheUri);
   const { fromDay, toDay } = dayRange();
+  const { fromBlock, toBlock } = await resolveBlockRange({
+    chain,
+    fromDay,
+    toDay,
+  });
+  const chunkUris = (
+    await listTransferChunks({
+      cacheDest,
+      fromBlock,
+      toBlock,
+    })
+  ).map((chunk) => chunk.cacheUri);
 
   if (chunkUris.length === 0) {
     logLine("skipped flow build with no transfer chunks", { chain });
@@ -341,6 +412,8 @@ const buildChainFlows = async ({
     chunks: chunkUris.length,
     from_day: fromDay,
     to_day: toDay,
+    from_block: fromBlock,
+    to_block: toBlock,
   });
 
   logLine("building flows stage", { chain, stage: "manifest", chunks: chunkUris.length });
@@ -351,7 +424,7 @@ const buildChainFlows = async ({
     }),
   );
 
-  logLine("building flows stage", { chain, stage: "source_view" });
+  logLine("building flows stage", { chain, stage: "source_table" });
   await run(connection, sourceViewSql({ chain, chunkUris, fromDay, toDay }));
 
   logLine("building flows stage", { chain, stage: "daily_totals" });
