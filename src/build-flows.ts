@@ -121,6 +121,8 @@ const dayTimestamp = (value: string) => Math.floor(Date.parse(`${value}T00:00:00
 const tempDirectory = (chain: Chain) =>
   process.env.ANALYTICS_TEMP_DIRECTORY || `./analytics/${chain}-duckdb-tmp`;
 
+const daySql = "cast(date_trunc('day', timezone('UTC', to_timestamp(block_timestamp / 1000.0))) as date)";
+
 const configureDuckDb = async ({
   connection,
   chain,
@@ -145,18 +147,18 @@ const configureDuckDb = async ({
 const sourceViewSql = ({
   chain,
   chunkUris,
-  fromDay,
-  toDay,
+  fromBlock,
+  toBlock,
 }: {
   chain: Chain;
   chunkUris: string[];
-  fromDay?: string;
-  toDay?: string;
+  fromBlock?: number;
+  toBlock?: number;
 }) => `
   create or replace temp table source_transfers as
   select
     '${escapeSqlString(chain)}' as chain,
-    cast(date_trunc('day', timezone('UTC', to_timestamp(block_timestamp))) as date) as day,
+    ${daySql} as day,
     token_address,
     transaction_hash,
     from_address,
@@ -165,8 +167,8 @@ const sourceViewSql = ({
     block_number
   from read_parquet(${sqlStringList(chunkUris)})
   where true
-    ${fromDay ? `and cast(date_trunc('day', timezone('UTC', to_timestamp(block_timestamp))) as date) >= date '${escapeSqlString(fromDay)}'` : ""}
-    ${toDay ? `and cast(date_trunc('day', timezone('UTC', to_timestamp(block_timestamp))) as date) <= date '${escapeSqlString(toDay)}'` : ""}
+    ${fromBlock !== undefined ? `and block_number >= ${fromBlock}` : ""}
+    ${toBlock !== undefined ? `and block_number <= ${toBlock}` : ""}
 `;
 
 const manifestTableSql = ({
@@ -277,6 +279,20 @@ type FlowSummary = {
   first_day: string;
   last_day: string;
 };
+
+type SourceSummary = {
+  rows: number;
+  first_day: string;
+  last_day: string;
+};
+
+const sourceSummarySql = `
+  select
+    count(*) as rows,
+    cast(min(day) as varchar) as first_day,
+    cast(max(day) as varchar) as last_day
+  from source_transfers
+`;
 
 const createTokenDailyTotalsTableSql = `
   create table if not exists token_daily_totals (
@@ -425,7 +441,14 @@ const buildChainFlows = async ({
   );
 
   logLine("building flows stage", { chain, stage: "source_table" });
-  await run(connection, sourceViewSql({ chain, chunkUris, fromDay, toDay }));
+  await run(connection, sourceViewSql({ chain, chunkUris, fromBlock, toBlock }));
+  const [sourceSummary] = await rows<SourceSummary>(connection, sourceSummarySql);
+  logLine("built flows source", {
+    chain,
+    source_rows: sourceSummary?.rows,
+    first_day: sourceSummary?.first_day,
+    last_day: sourceSummary?.last_day,
+  });
 
   logLine("building flows stage", { chain, stage: "daily_totals" });
   await run(connection, createTokenDailyTotalsTableSql);
