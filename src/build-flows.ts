@@ -16,6 +16,17 @@ const assertEnv = (value: string | undefined, key: string) => {
 };
 
 const envValue = (key: string) => process.env[key];
+const parseDay = (value: string | undefined, key: string) => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new Error(`invalid ${key}: ${value}; expected YYYY-MM-DD`);
+  }
+
+  return value;
+};
 
 const splitChainArgs = (values: string[]) =>
   values.flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean);
@@ -88,6 +99,17 @@ const sqlStringList = (values: string[]) =>
 const outputPath = (chain: Chain) =>
   process.env.ANALYTICS_DB_PATH || `./analytics/${chain}-flows.duckdb`;
 
+const dayRange = () => {
+  const fromDay = parseDay(envValue("ANALYTICS_FROM_DAY"), "ANALYTICS_FROM_DAY");
+  const toDay = parseDay(envValue("ANALYTICS_TO_DAY"), "ANALYTICS_TO_DAY");
+
+  if (fromDay && toDay && fromDay > toDay) {
+    throw new Error(`invalid day range: ${fromDay} > ${toDay}`);
+  }
+
+  return { fromDay, toDay };
+};
+
 const tempDirectory = (chain: Chain) =>
   process.env.ANALYTICS_TEMP_DIRECTORY || `./analytics/${chain}-duckdb-tmp`;
 
@@ -115,9 +137,13 @@ const configureDuckDb = async ({
 const sourceViewSql = ({
   chain,
   chunkUris,
+  fromDay,
+  toDay,
 }: {
   chain: Chain;
   chunkUris: string[];
+  fromDay?: string;
+  toDay?: string;
 }) => `
   create or replace temp view source_transfers as
   select
@@ -130,6 +156,9 @@ const sourceViewSql = ({
     coalesce(amount_double, try_cast(amount_text as double)) as amount_native,
     block_number
   from read_parquet(${sqlStringList(chunkUris)})
+  where true
+    ${fromDay ? `and cast(date_trunc('day', timezone('UTC', to_timestamp(block_timestamp))) as date) >= date '${escapeSqlString(fromDay)}'` : ""}
+    ${toDay ? `and cast(date_trunc('day', timezone('UTC', to_timestamp(block_timestamp))) as date) <= date '${escapeSqlString(toDay)}'` : ""}
 `;
 
 const manifestTableSql = ({
@@ -142,8 +171,7 @@ const manifestTableSql = ({
   from read_parquet('${escapeSqlString(manifestUri)}')
 `;
 
-const dailyTokenTotalsSql = `
-  create or replace table token_daily_totals as
+const dailyTokenTotalsSelectSql = `
   select
     chain,
     day,
@@ -156,8 +184,7 @@ const dailyTokenTotalsSql = `
   group by 1, 2, 3
 `;
 
-const dailyTopFlowsSql = `
-  create or replace table token_daily_top_flows as
+const dailyTopFlowsSelectSql = `
   with senders as (
     select
       chain,
@@ -243,6 +270,56 @@ type FlowSummary = {
   last_day: string;
 };
 
+const createTokenDailyTotalsTableSql = `
+  create table if not exists token_daily_totals (
+    chain varchar,
+    day date,
+    token_address varchar,
+    transfer_count bigint,
+    amount_native_sum double,
+    avg_amount_native double
+  )
+`;
+
+const createTokenDailyTopFlowsTableSql = `
+  create table if not exists token_daily_top_flows (
+    chain varchar,
+    day date,
+    token_address varchar,
+    token_name varchar,
+    token_symbol varchar,
+    token_decimals integer,
+    target_source varchar,
+    coingecko_id varchar,
+    coingecko_name varchar,
+    coingecko_symbol varchar,
+    direction varchar,
+    address varchar,
+    flow_rank bigint,
+    transfer_count bigint,
+    amount_native_sum double,
+    avg_amount_native double
+  )
+`;
+
+const deleteDayRangeSql = ({
+  table,
+  fromDay,
+  toDay,
+}: {
+  table: string;
+  fromDay?: string;
+  toDay?: string;
+}) =>
+  fromDay || toDay
+    ? `
+      delete from ${table}
+      where true
+        ${fromDay ? `and day >= date '${escapeSqlString(fromDay)}'` : ""}
+        ${toDay ? `and day <= date '${escapeSqlString(toDay)}'` : ""}
+      `
+    : `delete from ${table}`;
+
 const buildChainFlows = async ({
   connection,
   chain,
@@ -252,11 +329,19 @@ const buildChainFlows = async ({
 }) => {
   const cacheDest = getCacheDest(chain);
   const chunkUris = (await listTransferChunks({ cacheDest })).map((chunk) => chunk.cacheUri);
+  const { fromDay, toDay } = dayRange();
 
   if (chunkUris.length === 0) {
     logLine("skipped flow build with no transfer chunks", { chain });
     return;
   }
+
+  logLine("starting flows build", {
+    chain,
+    chunks: chunkUris.length,
+    from_day: fromDay,
+    to_day: toDay,
+  });
 
   logLine("building flows stage", { chain, stage: "manifest", chunks: chunkUris.length });
   await run(
@@ -267,13 +352,17 @@ const buildChainFlows = async ({
   );
 
   logLine("building flows stage", { chain, stage: "source_view" });
-  await run(connection, sourceViewSql({ chain, chunkUris }));
+  await run(connection, sourceViewSql({ chain, chunkUris, fromDay, toDay }));
 
   logLine("building flows stage", { chain, stage: "daily_totals" });
-  await run(connection, dailyTokenTotalsSql);
+  await run(connection, createTokenDailyTotalsTableSql);
+  await run(connection, deleteDayRangeSql({ table: "token_daily_totals", fromDay, toDay }));
+  await run(connection, `insert into token_daily_totals ${dailyTokenTotalsSelectSql}`);
 
   logLine("building flows stage", { chain, stage: "daily_top_flows" });
-  await run(connection, dailyTopFlowsSql);
+  await run(connection, createTokenDailyTopFlowsTableSql);
+  await run(connection, deleteDayRangeSql({ table: "token_daily_top_flows", fromDay, toDay }));
+  await run(connection, `insert into token_daily_top_flows ${dailyTopFlowsSelectSql}`);
 
   const [summary] = await rows<FlowSummary>(connection, summarySql);
 
