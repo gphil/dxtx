@@ -1268,6 +1268,24 @@ const exportToPostgres = async ({
   }
 };
 
+const ensurePostgresSchema = async () => {
+  const databaseUrl = postgresConnectionString();
+
+  if (!databaseUrl) {
+    return;
+  }
+
+  const client = new Client({ connectionString: databaseUrl });
+
+  await client.connect();
+
+  try {
+    await client.query(createServingSchemaSql);
+  } finally {
+    await client.end();
+  }
+};
+
 const resetLocalState = async (connection: DuckDBConnection) => {
   await run(connection, "drop table if exists processed_flow_chunks");
   await run(connection, "drop table if exists token_manifest");
@@ -1403,6 +1421,7 @@ const main = async () => {
 
   try {
     await configureDuckDb({ connection, chain });
+    await ensurePostgresSchema();
 
     if (isS3Uri(getCacheDest(chain))) {
       await configureS3(connection, process.env);
