@@ -56,6 +56,12 @@ Incrementally sync flows from newly published chunks into a dedicated local Duck
 npm run sync:flows -- ethereum
 ```
 
+Start the local serving Postgres used by `sync:flows`:
+
+```bash
+npm run db:up
+```
+
 Run the flow sync worker continuously:
 
 ```bash
@@ -132,7 +138,9 @@ sqd process:all
 - `FLOW_SYNC_FROM_DAY`, `FLOW_SYNC_TO_DAY`
   optional day-bounded backfill range for the incremental flow sync worker
 - `FLOWS_DATABASE_URL`
-  optional Postgres/Neon connection string; when set, `sync:flows` publishes compact serving tables after each pass
+  optional explicit Postgres connection string; when set, `sync:flows` publishes compact serving tables after each pass
+- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME`
+  optional local Docker Postgres settings; if `FLOWS_DATABASE_URL` is unset and any `DB_*` value is set, `sync:flows` derives a local Postgres connection string from these values
 
 Per-chain overrides use the same suffix pattern:
 
@@ -156,14 +164,26 @@ Resume is cache-first. The publisher resumes from the last flushed transfer chun
 
 - Keep the raw transfer cache publishing continuously to B2 with `sqd process:*`.
 - Run `sync:flows` against a separate local DuckDB database on the indexer box.
+- Run a local Dockerized Postgres for serving tables with `npm run db:up`.
 - Let `sync:flows` process only new parquet chunks and maintain:
   - `processed_flow_chunks`
   - `token_daily_totals`
   - `token_daily_address_flows`
   - `token_daily_top_flows`
   - `token_flow_leaderboards_current`
-- When `FLOWS_DATABASE_URL` is set, publish compact serving tables to Postgres/Neon:
+- When `FLOWS_DATABASE_URL` is set, or when local `DB_*` settings are present, publish compact serving tables to Postgres:
   - `token_flow_daily_totals`
   - `token_flow_leaderboards`
 
 `build:flows` is still useful for ad hoc or bounded historical analysis. `sync:flows` is the long-running production path and uses its own local DuckDB file by default so it does not conflict with the ad hoc analytics database.
+
+For a local serving database, the default Docker/Postgres shape is:
+
+```bash
+DB_PORT=15432
+DB_USER=squid
+DB_PASS=squid
+DB_NAME=dxtx_flows
+```
+
+With those values in `.env`, `npm run db:up` starts Postgres and `npm run sync:flows -- ethereum` will publish serving tables there without needing a separate `FLOWS_DATABASE_URL`.

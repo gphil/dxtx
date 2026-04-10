@@ -26,6 +26,32 @@ const envFlag = (key: string) => {
   const value = process.env[key];
   return value === "1" || value === "true";
 };
+const hasValue = (value: string | undefined) => value !== undefined && value !== "";
+const postgresConnectionString = () => {
+  const directUrl = envValue("FLOWS_DATABASE_URL");
+
+  if (hasValue(directUrl)) {
+    return directUrl;
+  }
+
+  const dbUser = envValue("DB_USER");
+  const dbPass = envValue("DB_PASS");
+  const dbName = envValue("DB_NAME");
+  const dbPort = envValue("DB_PORT");
+  const dbHost = envValue("DB_HOST");
+
+  if (![dbUser, dbPass, dbName, dbPort, dbHost].some(hasValue)) {
+    return undefined;
+  }
+
+  const user = encodeURIComponent(dbUser || "squid");
+  const password = encodeURIComponent(dbPass || "squid");
+  const host = dbHost || "127.0.0.1";
+  const port = dbPort || "15432";
+  const database = encodeURIComponent(dbName || "dxtx_flows");
+
+  return `postgresql://${user}:${password}@${host}:${port}/${database}`;
+};
 
 const splitArgs = (values: string[]) =>
   values.flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean);
@@ -1057,7 +1083,7 @@ const exportToPostgres = async ({
   fullRebuild: boolean;
   latestDay: string;
 }) => {
-  const databaseUrl = envValue("FLOWS_DATABASE_URL");
+  const databaseUrl = postgresConnectionString();
 
   if (!databaseUrl) {
     return;

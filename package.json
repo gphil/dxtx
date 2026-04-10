@@ -7,6 +7,10 @@
   "scripts": {
     "clean": "npx --yes rimraf lib",
     "build": "npm run clean && tsc -p tsconfig.json",
+    "db:up": "docker compose up -d db",
+    "db:down": "docker compose down",
+    "db:logs": "docker compose logs -f db",
+    "db:psql": "docker compose exec db psql -U ${DB_USER:-squid} -d ${DB_NAME:-dxtx_flows}",
     "process:all": "node --require=dotenv/config lib/all/publish.js",
     "process:ethereum": "node --require=dotenv/config lib/ethereum/publish.js",
     "process:base": "node --require=dotenv/config lib/base/publish.js",
