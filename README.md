@@ -93,7 +93,7 @@ node --require=dotenv/config lib/all/publish.js
 node --require=dotenv/config lib/base/publish.js
 ```
 
-`process:all` resolves Dune token metadata once for the selected token universe, then shares that snapshot with the per-chain publishers. Chain publishers only use RPC for misses.
+`process:all` resolves Dune token metadata once for the selected token universe, then shares that snapshot with the per-chain publishers. For open-ended runs without `CACHE_TO_BLOCK*`, it keeps polling after catch-up instead of exiting. Chain publishers only use RPC for misses.
 
 Run a bounded dev slice:
 
@@ -119,6 +119,8 @@ sqd process:all
 
 - `CACHE_TO_BLOCK`
   stop block for a bounded run
+- `CACHE_POLL_INTERVAL_SEC`
+  sleep interval between open-ended `process:all` polling passes after catch-up; defaults to `60`
 - `CACHE_CHUNK_SIZE_MB`
   target SQD file-store chunk size in MB
 - `CACHE_LOG_FILTER_MODE`
@@ -183,6 +185,7 @@ Resume is cache-first. The publisher resumes from the last flushed transfer chun
 - When `FLOWS_DATABASE_URL` is set, or when local `DB_*` settings are present, publish compact serving tables to Postgres:
   - `token_flow_daily_totals`
   - `token_flow_leaderboards`
+  - these serving tables use `network` values aligned with Dexosphere, such as `eth`, `base`, `arbitrum`, and `bsc`
 
 `build:flows` is still useful for ad hoc or bounded historical analysis. `sync:flows` is the long-running production path and uses its own local DuckDB file by default so it does not conflict with the ad hoc analytics database.
 

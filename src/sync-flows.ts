@@ -12,6 +12,33 @@ import type { Chain } from "./types.js";
 
 const flowWindows = [1, 7, 30, 90] as const;
 const daySql = "cast(date_trunc('day', timezone('UTC', to_timestamp(block_timestamp / 1000.0))) as date)";
+type Network = "eth" | "base" | "arbitrum" | "optimism" | "polygon" | "avalanche" | "bsc" | "unichain";
+const networkByChain: Record<Chain, Network> = {
+  ethereum: "eth",
+  base: "base",
+  arbitrum: "arbitrum",
+  optimism: "optimism",
+  polygon: "polygon",
+  avalanche: "avalanche",
+  bsc: "bsc",
+  unichain: "unichain",
+};
+const networkName = (chain: Chain): Network => networkByChain[chain];
+const networkMappings = Object.entries(networkByChain) as Array<[Chain, Network]>;
+const legacyNetworkValuesSql = networkMappings
+  .map(([chain]) => `'${escapeSqlString(chain)}'`)
+  .join(", ");
+const normalizedNetworkSql = (column: string) => `
+  case ${column}
+    ${networkMappings
+      .map(
+        ([chain, network]) =>
+          `when '${escapeSqlString(chain)}' then '${escapeSqlString(network)}'`,
+      )
+      .join("\n    ")}
+    else ${column}
+  end
+`;
 
 const assertEnv = (value: string | undefined, key: string) => {
   if (!value) {
@@ -866,12 +893,11 @@ type LatestDayRow = {
 };
 
 type TokenExportRow = {
-  chain: string;
   token_address: string;
 };
 
 type DailyTotalExportRow = {
-  chain: string;
+  network: string;
   token_address: string;
   day: string;
   transfer_count: bigint | number;
@@ -882,7 +908,7 @@ type DailyTotalExportRow = {
 };
 
 type LeaderboardExportRow = {
-  chain: string;
+  network: string;
   token_address: string;
   token_name: string | null;
   token_symbol: string | null;
@@ -927,13 +953,15 @@ const dailyTotalsExportSql = ({
   asOfTs,
   latestDay,
   fullRebuild,
+  network,
 }: {
   asOfTs: string;
   latestDay: string;
   fullRebuild: boolean;
+  network: Network;
 }) => `
   select
-    totals.chain,
+    '${escapeSqlString(network)}' as network,
     totals.token_address,
     cast(totals.day as varchar) as day,
     totals.transfer_count,
@@ -945,9 +973,17 @@ const dailyTotalsExportSql = ({
   where ${fullRebuild ? "true" : "exists (select 1 from source_days_tokens as affected where affected.chain = totals.chain and affected.day = totals.day and affected.token_address = totals.token_address)"}
 `;
 
-const leaderboardExportSql = ({ asOfTs, fullRebuild }: { asOfTs: string; fullRebuild: boolean }) => `
+const leaderboardExportSql = ({
+  asOfTs,
+  fullRebuild,
+  network,
+}: {
+  asOfTs: string;
+  fullRebuild: boolean;
+  network: Network;
+}) => `
   select
-    chain,
+    '${escapeSqlString(network)}' as network,
     token_address,
     token_name,
     token_symbol,
@@ -973,10 +1009,9 @@ const leaderboardExportSql = ({ asOfTs, fullRebuild }: { asOfTs: string; fullReb
 
 const affectedTokensSql = `
   select distinct
-    chain,
     token_address
   from source_tokens
-  order by chain, token_address
+  order by token_address
 `;
 
 const normalizePgValue = (value: unknown): unknown =>
@@ -988,8 +1023,24 @@ const chunkRows = <T>(values: T[], size: number) =>
   );
 
 const createServingSchemaSql = `
+  do $$
+  begin
+    begin
+      alter table token_flow_daily_totals rename column chain to network;
+    exception
+      when undefined_column or duplicate_column or undefined_table then null;
+    end;
+
+    begin
+      alter table token_flow_leaderboards rename column chain to network;
+    exception
+      when undefined_column or duplicate_column or undefined_table then null;
+    end;
+  end
+  $$;
+
   create table if not exists token_flow_daily_totals (
-    chain text not null,
+    network text not null,
     token_address text not null,
     day date not null,
     transfer_count bigint not null,
@@ -997,11 +1048,11 @@ const createServingSchemaSql = `
     avg_amount_native double precision,
     is_partial_day boolean not null,
     as_of_ts timestamptz not null,
-    primary key (chain, token_address, day)
+    primary key (network, token_address, day)
   );
 
   create table if not exists token_flow_leaderboards (
-    chain text not null,
+    network text not null,
     token_address text not null,
     token_name text,
     token_symbol text,
@@ -1021,8 +1072,16 @@ const createServingSchemaSql = `
     amount_native_sum double precision not null,
     avg_amount_native double precision,
     as_of_ts timestamptz not null,
-    primary key (chain, token_address, window_days, metric, flow_rank)
+    primary key (network, token_address, window_days, metric, flow_rank)
   );
+
+  update token_flow_daily_totals
+  set network = ${normalizedNetworkSql("network")}
+  where network in (${legacyNetworkValuesSql});
+
+  update token_flow_leaderboards
+  set network = ${normalizedNetworkSql("network")}
+  where network in (${legacyNetworkValuesSql});
 `;
 
 const insertRowsSql = ({
@@ -1059,17 +1118,17 @@ const insertRowsSql = ({
 
 const deleteAffectedLeaderboardRows = async ({
   client,
-  chain,
+  network,
   tokens,
   fullRebuild,
 }: {
   client: Client;
-  chain: Chain;
+  network: Network;
   tokens: TokenExportRow[];
   fullRebuild: boolean;
 }) => {
   if (fullRebuild) {
-    await client.query("delete from token_flow_leaderboards where chain = $1", [chain]);
+    await client.query("delete from token_flow_leaderboards where network = $1", [network]);
     return;
   }
 
@@ -1078,13 +1137,13 @@ const deleteAffectedLeaderboardRows = async ({
   }
 
   const values = tokens.map((_, index) => `($1, $${index + 2})`).join(", ");
-  const params = [chain, ...tokens.map((token) => token.token_address)];
+  const params = [network, ...tokens.map((token) => token.token_address)];
 
   await client.query(
     `
       delete from token_flow_leaderboards as target
-      using (values ${values}) as affected(chain, token_address)
-      where affected.chain = target.chain
+      using (values ${values}) as affected(network, token_address)
+      where affected.network = target.network
         and affected.token_address = target.token_address
     `,
     params,
@@ -1103,6 +1162,7 @@ const exportToPostgres = async ({
   latestDay: string;
 }) => {
   const databaseUrl = postgresConnectionString();
+  const network = networkName(chain);
 
   if (!databaseUrl) {
     return;
@@ -1111,11 +1171,11 @@ const exportToPostgres = async ({
   const asOfTs = new Date().toISOString();
   const dailyTotals = await rows<DailyTotalExportRow>(
     connection,
-    dailyTotalsExportSql({ asOfTs, latestDay, fullRebuild }),
+    dailyTotalsExportSql({ asOfTs, latestDay, fullRebuild, network }),
   );
   const leaderboards = await rows<LeaderboardExportRow>(
     connection,
-    leaderboardExportSql({ asOfTs, fullRebuild }),
+    leaderboardExportSql({ asOfTs, fullRebuild, network }),
   );
   const affectedTokens = fullRebuild ? [] : await rows<TokenExportRow>(connection, affectedTokensSql);
   const client = new Client({ connectionString: databaseUrl });
@@ -1128,7 +1188,7 @@ const exportToPostgres = async ({
 
     if (dailyTotals.length > 0) {
       const columns = [
-        "chain",
+        "network",
         "token_address",
         "day",
         "transfer_count",
@@ -1143,7 +1203,7 @@ const exportToPostgres = async ({
           table: "token_flow_daily_totals",
           columns,
           rows: chunk as unknown as Record<string, unknown>[],
-          conflict: ["chain", "token_address", "day"],
+          conflict: ["network", "token_address", "day"],
           updates: columns.slice(3),
         });
         await client.query(text, params);
@@ -1152,14 +1212,14 @@ const exportToPostgres = async ({
 
     await deleteAffectedLeaderboardRows({
       client,
-      chain,
+      network,
       tokens: affectedTokens,
       fullRebuild,
     });
 
     if (leaderboards.length > 0) {
       const columns = [
-        "chain",
+        "network",
         "token_address",
         "token_name",
         "token_symbol",
@@ -1186,7 +1246,7 @@ const exportToPostgres = async ({
           table: "token_flow_leaderboards",
           columns,
           rows: chunk as unknown as Record<string, unknown>[],
-          conflict: ["chain", "token_address", "window_days", "metric", "flow_rank"],
+          conflict: ["network", "token_address", "window_days", "metric", "flow_rank"],
           updates: columns.slice(2),
         });
         await client.query(text, params);

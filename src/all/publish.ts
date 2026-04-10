@@ -16,9 +16,18 @@ const maxRecentLines = 20;
 const restartScheduleMs = [5_000, 10_000, 30_000, 60_000, 120_000];
 const transientExitPattern =
   /ECONNRESET|FetchError|aborted|socket hang up|timed out|timeout|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|429|502|503|504|rate limit/i;
+const skippedPublishPattern = /skipped chain with no token targets/i;
+const hasValue = (value: string | undefined) => value !== undefined && value !== "";
+const normalizeEnvName = (chain: Chain) => chain.toUpperCase();
+const envValue = (baseKey: string, chain: Chain) =>
+  process.env[`${baseKey}_${normalizeEnvName(chain)}`] ?? process.env[baseKey];
 const restartDelayMs = (attempt: number): number => {
   const delay = restartScheduleMs[Math.min(attempt, restartScheduleMs.length - 1)];
   return delay ?? 120_000;
+};
+const publishPollIntervalMs = () => {
+  const value = Number.parseInt(process.env.CACHE_POLL_INTERVAL_SEC || "60", 10);
+  return Math.max(1, Number.isFinite(value) ? value : 60) * 1_000;
 };
 
 type ChildExit = {
@@ -124,6 +133,9 @@ const shouldRestartChain = ({ signal, recentLines }: ChildExit) => {
   return transientExitPattern.test(recentLines.join("\n"));
 };
 
+const shouldContinuePollingChain = (chain: Chain, recentLines: string[]) =>
+  !hasValue(envValue("CACHE_TO_BLOCK", chain)) && !skippedPublishPattern.test(recentLines.join("\n"));
+
 const runChainOnce = (chain: Chain, sharedMetadataPath: string) =>
   new Promise<ChildExit>((resolve, reject) => {
     const child = spawn(
@@ -159,7 +171,21 @@ const runChain = async (chain: Chain, sharedMetadataPath: string) => {
     const result = await runChainOnce(chain, sharedMetadataPath);
 
     if (result.code === 0) {
-      return;
+      restartCount = 0;
+
+      if (!shouldContinuePollingChain(chain, result.recentLines)) {
+        return;
+      }
+
+      const backoffMs = publishPollIntervalMs();
+
+      logLine("polling chain publisher", {
+        chain,
+        poll_in_sec: Math.round(backoffMs / 1_000),
+      });
+
+      await sleep(backoffMs);
+      continue;
     }
 
     const error = recentFailureLine(result.recentLines);
