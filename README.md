@@ -44,6 +44,36 @@ Check block freshness against the current SQD archive height:
 npm run check:freshness -- base
 ```
 
+Build or refresh a local analytics database for one chain:
+
+```bash
+npm run build:flows -- ethereum
+```
+
+Incrementally sync flows from newly published chunks into a dedicated local DuckDB:
+
+```bash
+npm run sync:flows -- ethereum
+```
+
+Run the flow sync worker continuously:
+
+```bash
+FLOW_SYNC_LOOP=1 FLOW_SYNC_INTERVAL_SEC=300 npm run sync:flows -- ethereum
+```
+
+Inspect a token flow slice from the local analytics database:
+
+```bash
+npm run inspect:flows -- ethereum usdc
+```
+
+Verify flow rows against cached transfers and RPC receipts:
+
+```bash
+npm run verify:flows -- ethereum usdc 2026-01-31 0x...
+```
+
 If you are not using the `sqd` CLI, the built node entrypoints are:
 
 ```bash
@@ -89,6 +119,20 @@ sqd process:all
   override the bundled token list snapshot path
 - `DUNE_API_KEY`
   optional token metadata source; falls back to RPC when missing or rate-limited
+- `FLOW_SYNC_DB_PATH`
+  local DuckDB path for the incremental flow sync worker; defaults to `./analytics/<chain>-flow-sync.duckdb`
+- `FLOW_SYNC_MAX_CHUNKS`
+  max number of new cache chunks to process per sync pass; defaults to `32`
+- `FLOW_SYNC_LOOP`
+  when `true`, keep polling for new chunks instead of running a single sync pass
+- `FLOW_SYNC_INTERVAL_SEC`
+  sleep interval between polling passes when `FLOW_SYNC_LOOP=true`; defaults to `300`
+- `FLOW_SYNC_RESET`
+  when `true`, drop the local incremental flow-sync state before the next pass
+- `FLOW_SYNC_FROM_DAY`, `FLOW_SYNC_TO_DAY`
+  optional day-bounded backfill range for the incremental flow sync worker
+- `FLOWS_DATABASE_URL`
+  optional Postgres/Neon connection string; when set, `sync:flows` publishes compact serving tables after each pass
 
 Per-chain overrides use the same suffix pattern:
 
@@ -107,3 +151,19 @@ Each chain publishes under its own cache prefix:
 - `<cache-dest>/<chain>/erc20-transfers/status.txt`
 
 Resume is cache-first. The publisher resumes from the last flushed transfer chunk in the file-store output.
+
+## Production shape
+
+- Keep the raw transfer cache publishing continuously to B2 with `sqd process:*`.
+- Run `sync:flows` against a separate local DuckDB database on the indexer box.
+- Let `sync:flows` process only new parquet chunks and maintain:
+  - `processed_flow_chunks`
+  - `token_daily_totals`
+  - `token_daily_address_flows`
+  - `token_daily_top_flows`
+  - `token_flow_leaderboards_current`
+- When `FLOWS_DATABASE_URL` is set, publish compact serving tables to Postgres/Neon:
+  - `token_flow_daily_totals`
+  - `token_flow_leaderboards`
+
+`build:flows` is still useful for ad hoc or bounded historical analysis. `sync:flows` is the long-running production path and uses its own local DuckDB file by default so it does not conflict with the ad hoc analytics database.

@@ -17,6 +17,7 @@
     "process:unichain": "node --require=dotenv/config lib/unichain/publish.js",
     "process:bsc": "node --require=dotenv/config lib/bsc/publish.js",
     "build:flows": "node --require=dotenv/config lib/build-flows.js",
+    "sync:flows": "node --require=dotenv/config lib/sync-flows.js",
     "inspect:flows": "node --require=dotenv/config lib/inspect-flows.js",
     "verify:flows": "node --require=dotenv/config lib/verify-flows.js",
     "check:cache": "node --require=dotenv/config lib/check-cache.js",
@@ -31,7 +32,9 @@
     "@subsquid/file-store": "^2.0.0",
     "@subsquid/file-store-parquet": "^1.1.1",
     "@subsquid/file-store-s3": "^2.0.1",
-    "dotenv": "^17.2.3"
+    "@types/pg": "^8.20.0",
+    "dotenv": "^17.2.3",
+    "pg": "^8.20.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

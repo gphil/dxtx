@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { loadDuneUniverseTokenMetadata } from "../dune-tokens.js";
 import { resolveRpcUrl, resolveSqdUrl } from "../chains.js";
@@ -11,6 +12,20 @@ import type { Chain } from "../types.js";
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
 const childEntryPath = (chain: Chain) => join(currentDir, "..", chain, "publish.js");
+const maxRecentLines = 20;
+const restartScheduleMs = [5_000, 10_000, 30_000, 60_000, 120_000];
+const transientExitPattern =
+  /ECONNRESET|FetchError|aborted|socket hang up|timed out|timeout|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|429|502|503|504|rate limit/i;
+const restartDelayMs = (attempt: number): number => {
+  const delay = restartScheduleMs[Math.min(attempt, restartScheduleMs.length - 1)];
+  return delay ?? 120_000;
+};
+
+type ChildExit = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  recentLines: string[];
+};
 
 const writeSharedMetadata = async (chains: Chain[]) => {
   const targetsByChain = await loadPublishTargetsByChain(chains);
@@ -45,6 +60,7 @@ const writePrefixedLines = (
   output: NodeJS.WriteStream,
   chunk: string,
   pending: string,
+  handleLine: (line: string) => void,
 ) => {
   const combined = `${pending}${chunk}`;
   const lines = combined.split(/\r?\n/);
@@ -52,12 +68,20 @@ const writePrefixedLines = (
 
   lines
     .filter(Boolean)
-    .forEach((line) => output.write(`[${chain}] ${line}\n`));
+    .forEach((line) => {
+      const prefixed = `[${chain}] ${line}`;
+      output.write(`${prefixed}\n`);
+      handleLine(prefixed);
+    });
 
   return nextPending;
 };
 
 const pipeChildOutput = (chain: Chain, child: ReturnType<typeof spawn>) => {
+  let recentLines: string[] = [];
+  const recordLine = (line: string) => {
+    recentLines = [...recentLines.slice(-(maxRecentLines - 1)), line];
+  };
   const attach = (
     stream: NodeJS.ReadableStream | null,
     output: NodeJS.WriteStream,
@@ -69,21 +93,39 @@ const pipeChildOutput = (chain: Chain, child: ReturnType<typeof spawn>) => {
     let pending = "";
     stream.setEncoding("utf8");
     stream.on("data", (chunk) => {
-      pending = writePrefixedLines(chain, output, chunk, pending);
+      pending = writePrefixedLines(chain, output, chunk, pending, recordLine);
     });
     stream.on("end", () => {
       if (pending) {
-        output.write(`[${chain}] ${pending}\n`);
+        const prefixed = `[${chain}] ${pending}`;
+        output.write(`${prefixed}\n`);
+        recordLine(prefixed);
       }
     });
   };
 
   attach(child.stdout, process.stdout);
   attach(child.stderr, process.stderr);
+
+  return () => recentLines;
 };
 
-const runChain = (chain: Chain, sharedMetadataPath: string) =>
-  new Promise<void>((resolve, reject) => {
+const recentFailureLine = (recentLines: string[]) =>
+  [...recentLines]
+    .reverse()
+    .find((line) => /fatal|error|fetcherror|econreset|aborted/i.test(line))
+    ?? recentLines.at(-1);
+
+const shouldRestartChain = ({ signal, recentLines }: ChildExit) => {
+  if (signal === "SIGINT" || signal === "SIGTERM") {
+    return false;
+  }
+
+  return transientExitPattern.test(recentLines.join("\n"));
+};
+
+const runChainOnce = (chain: Chain, sharedMetadataPath: string) =>
+  new Promise<ChildExit>((resolve, reject) => {
     const child = spawn(
       process.execPath,
       ["--require=dotenv/config", childEntryPath(chain)],
@@ -98,18 +140,51 @@ const runChain = (chain: Chain, sharedMetadataPath: string) =>
       },
     );
 
-    pipeChildOutput(chain, child);
+    const getRecentLines = pipeChildOutput(chain, child);
 
     child.on("error", reject);
     child.on("close", (code, signal) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-
-      reject(new Error(`chain=${chain} exited with code=${code ?? "null"} signal=${signal ?? "null"}`));
+      resolve({
+        code,
+        signal,
+        recentLines: getRecentLines(),
+      });
     });
   });
+
+const runChain = async (chain: Chain, sharedMetadataPath: string) => {
+  let restartCount = 0;
+
+  while (true) {
+    const result = await runChainOnce(chain, sharedMetadataPath);
+
+    if (result.code === 0) {
+      return;
+    }
+
+    const error = recentFailureLine(result.recentLines);
+
+    if (!shouldRestartChain(result)) {
+      throw new Error(
+        `chain=${chain} exited with code=${result.code ?? "null"} signal=${result.signal ?? "null"}${error ? ` recent=${error}` : ""}`,
+      );
+    }
+
+    const backoffMs = restartDelayMs(restartCount);
+    restartCount += 1;
+
+    logLine("restarting chain publisher", {
+      chain,
+      attempt: restartCount,
+      retry_in_sec: Math.round(backoffMs / 1_000),
+      exit_code: result.code ?? undefined,
+      signal: result.signal ?? undefined,
+      error,
+    });
+
+    await sleep(backoffMs);
+  }
+};
 
 const runnableChains = (chains: Chain[]) =>
   chains.filter((chain) => {
