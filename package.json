@@ -21,7 +21,7 @@
     "process:unichain": "node --require=dotenv/config lib/unichain/publish.js",
     "process:bsc": "node --require=dotenv/config lib/bsc/publish.js",
     "build:flows": "node --require=dotenv/config lib/build-flows.js",
-    "sync:flows": "node --require=dotenv/config lib/sync-flows.js",
+    "sync:flows": "node --require=dotenv/config lib/all/sync-flows.js",
     "inspect:flows": "node --require=dotenv/config lib/inspect-flows.js",
     "verify:flows": "node --require=dotenv/config lib/verify-flows.js",
     "check:cache": "node --require=dotenv/config lib/check-cache.js",

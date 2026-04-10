@@ -68,6 +68,12 @@ Run the flow sync worker continuously:
 FLOW_SYNC_LOOP=1 FLOW_SYNC_INTERVAL_SEC=300 npm run sync:flows -- ethereum
 ```
 
+Run flow sync across the selected chains in parallel:
+
+```bash
+CACHE_CHAINS=ethereum,base,arbitrum FLOW_SYNC_LOOP=1 FLOW_SYNC_INTERVAL_SEC=300 npm run sync:flows
+```
+
 Inspect a token flow slice from the local analytics database:
 
 ```bash
@@ -133,6 +139,8 @@ sqd process:all
   when `true`, keep polling for new chunks instead of running a single sync pass
 - `FLOW_SYNC_INTERVAL_SEC`
   sleep interval between polling passes when `FLOW_SYNC_LOOP=true`; defaults to `300`
+- `FLOW_SYNC_CONCURRENCY`
+  one-shot worker concurrency when `FLOW_SYNC_LOOP` is not set; defaults to `2`
 - `FLOW_SYNC_RESET`
   when `true`, drop the local incremental flow-sync state before the next pass
 - `FLOW_SYNC_FROM_DAY`, `FLOW_SYNC_TO_DAY`
@@ -165,6 +173,7 @@ Resume is cache-first. The publisher resumes from the last flushed transfer chun
 - Keep the raw transfer cache publishing continuously to B2 with `sqd process:*`.
 - Run `sync:flows` against a separate local DuckDB database on the indexer box.
 - Run a local Dockerized Postgres for serving tables with `npm run db:up`.
+- Let `npm run sync:flows` fan out to one worker per selected chain in loop mode, with each chain keeping its own local DuckDB file.
 - Let `sync:flows` process only new parquet chunks and maintain:
   - `processed_flow_chunks`
   - `token_daily_totals`
