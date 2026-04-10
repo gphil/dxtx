@@ -198,42 +198,120 @@ const dailyTokenTotalsSelectSql = `
   group by 1, 2, 3
 `;
 
-const dailyTopFlowsSelectSql = `
+const dailyAddressFlowsSelectSql = `
   with senders as (
     select
       chain,
       day,
       token_address,
-      'sender' as direction,
       from_address as address,
-      count(*) as transfer_count,
-      sum(amount_native) as amount_native_sum,
-      avg(amount_native) as avg_amount_native
+      count(*) as sent_transfer_count,
+      sum(amount_native) as sent_amount_native_sum
     from source_transfers
     where amount_native is not null
-    group by 1, 2, 3, 4, 5
+      and from_address is not null
+    group by 1, 2, 3, 4
   ),
   recipients as (
     select
       chain,
       day,
       token_address,
-      'recipient' as direction,
       to_address as address,
-      count(*) as transfer_count,
-      sum(amount_native) as amount_native_sum,
-      avg(amount_native) as avg_amount_native
+      count(*) as received_transfer_count,
+      sum(amount_native) as received_amount_native_sum
     from source_transfers
     where amount_native is not null
-    group by 1, 2, 3, 4, 5
-  )
-  ,
-  flows as (
-    select *
+      and to_address is not null
+    group by 1, 2, 3, 4
+  ),
+  addresses as (
+    select
+      coalesce(senders.chain, recipients.chain) as chain,
+      coalesce(senders.day, recipients.day) as day,
+      coalesce(senders.token_address, recipients.token_address) as token_address,
+      coalesce(senders.address, recipients.address) as address,
+      coalesce(senders.sent_transfer_count, 0) as sent_transfer_count,
+      coalesce(recipients.received_transfer_count, 0) as received_transfer_count,
+      coalesce(senders.sent_amount_native_sum, 0) as sent_amount_native_sum,
+      coalesce(recipients.received_amount_native_sum, 0) as received_amount_native_sum
     from senders
+    full outer join recipients
+      on recipients.chain = senders.chain
+     and recipients.day = senders.day
+     and recipients.token_address = senders.token_address
+     and recipients.address = senders.address
+  )
+  select
+    addresses.chain,
+    addresses.day,
+    addresses.token_address,
+    manifest.token_name,
+    manifest.token_symbol,
+    manifest.token_decimals,
+    manifest.target_source,
+    manifest.coingecko_id,
+    manifest.coingecko_name,
+    manifest.coingecko_symbol,
+    addresses.address,
+    addresses.sent_transfer_count,
+    addresses.received_transfer_count,
+    addresses.sent_transfer_count + addresses.received_transfer_count as total_transfer_count,
+    addresses.sent_amount_native_sum,
+    addresses.received_amount_native_sum,
+    addresses.sent_amount_native_sum + addresses.received_amount_native_sum as gross_amount_native_sum,
+    addresses.received_amount_native_sum - addresses.sent_amount_native_sum as net_amount_native_sum
+  from addresses
+  left join token_manifest as manifest
+    on manifest.chain = addresses.chain
+   and manifest.address = addresses.token_address
+`;
+
+const dailyTopFlowsSelectSql = `
+  with flows as (
+    select
+      chain,
+      day,
+      token_address,
+      token_name,
+      token_symbol,
+      token_decimals,
+      target_source,
+      coingecko_id,
+      coingecko_name,
+      coingecko_symbol,
+      'sender' as direction,
+      address,
+      sent_transfer_count as transfer_count,
+      sent_amount_native_sum as amount_native_sum,
+      case
+        when sent_transfer_count = 0 then null
+        else sent_amount_native_sum / sent_transfer_count
+      end as avg_amount_native
+    from token_daily_address_flows
+    where sent_transfer_count > 0
     union all
-    select *
-    from recipients
+    select
+      chain,
+      day,
+      token_address,
+      token_name,
+      token_symbol,
+      token_decimals,
+      target_source,
+      coingecko_id,
+      coingecko_name,
+      coingecko_symbol,
+      'recipient' as direction,
+      address,
+      received_transfer_count as transfer_count,
+      received_amount_native_sum as amount_native_sum,
+      case
+        when received_transfer_count = 0 then null
+        else received_amount_native_sum / received_transfer_count
+      end as avg_amount_native
+    from token_daily_address_flows
+    where received_transfer_count > 0
   ),
   ranked as (
     select
@@ -245,26 +323,23 @@ const dailyTopFlowsSelectSql = `
     from flows
   )
   select
-    ranked.chain,
-    ranked.day,
-    ranked.token_address,
-    manifest.token_name,
-    manifest.token_symbol,
-    manifest.token_decimals,
-    manifest.target_source,
-    manifest.coingecko_id,
-    manifest.coingecko_name,
-    manifest.coingecko_symbol,
-    ranked.direction,
-    ranked.address,
-    ranked.flow_rank,
-    ranked.transfer_count,
-    ranked.amount_native_sum,
-    ranked.avg_amount_native
+    chain,
+    day,
+    token_address,
+    token_name,
+    token_symbol,
+    token_decimals,
+    target_source,
+    coingecko_id,
+    coingecko_name,
+    coingecko_symbol,
+    direction,
+    address,
+    flow_rank,
+    transfer_count,
+    amount_native_sum,
+    avg_amount_native
   from ranked
-  left join token_manifest as manifest
-    on manifest.chain = ranked.chain
-   and manifest.address = ranked.token_address
   where ranked.flow_rank <= 50
 `;
 
@@ -306,6 +381,29 @@ const createTokenDailyTotalsTableSql = `
     transfer_count bigint,
     amount_native_sum double,
     avg_amount_native double
+  )
+`;
+
+const createTokenDailyAddressFlowsTableSql = `
+  create table if not exists token_daily_address_flows (
+    chain varchar,
+    day date,
+    token_address varchar,
+    token_name varchar,
+    token_symbol varchar,
+    token_decimals integer,
+    target_source varchar,
+    coingecko_id varchar,
+    coingecko_name varchar,
+    coingecko_symbol varchar,
+    address varchar,
+    sent_transfer_count bigint,
+    received_transfer_count bigint,
+    total_transfer_count bigint,
+    sent_amount_native_sum double,
+    received_amount_native_sum double,
+    gross_amount_native_sum double,
+    net_amount_native_sum double
   )
 `;
 
@@ -443,6 +541,7 @@ const buildChainFlows = async ({
   if (reset) {
     logLine("building flows stage", { chain, stage: "reset" });
     await run(connection, dropTableSql("token_daily_top_flows"));
+    await run(connection, dropTableSql("token_daily_address_flows"));
     await run(connection, dropTableSql("token_daily_totals"));
     await run(connection, dropTableSql("token_manifest"));
   }
@@ -469,6 +568,11 @@ const buildChainFlows = async ({
   await run(connection, createTokenDailyTotalsTableSql);
   await run(connection, deleteDayRangeSql({ table: "token_daily_totals", fromDay, toDay }));
   await run(connection, `insert into token_daily_totals ${dailyTokenTotalsSelectSql}`);
+
+  logLine("building flows stage", { chain, stage: "daily_address_flows" });
+  await run(connection, createTokenDailyAddressFlowsTableSql);
+  await run(connection, deleteDayRangeSql({ table: "token_daily_address_flows", fromDay, toDay }));
+  await run(connection, `insert into token_daily_address_flows ${dailyAddressFlowsSelectSql}`);
 
   logLine("building flows stage", { chain, stage: "daily_top_flows" });
   await run(connection, createTokenDailyTopFlowsTableSql);

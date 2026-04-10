@@ -66,6 +66,14 @@ type FlowRow = {
   avg_amount_native: number;
 };
 
+type NetFlowRow = {
+  address: string;
+  sent_transfer_count: number;
+  received_transfer_count: number;
+  net_amount_native_sum: number;
+  gross_amount_native_sum: number;
+};
+
 const tokenLookupSql = (token: string) => {
   const value = escapeSqlString(token.toLowerCase());
   const addressMatch = token.startsWith("0x")
@@ -136,6 +144,32 @@ const topFlowsSql = ({
   limit 10
 `;
 
+const topNetFlowsSql = ({
+  address,
+  direction,
+  day,
+}: {
+  address: string;
+  direction: "in" | "out";
+  day: string;
+}) => `
+  select
+    address,
+    sent_transfer_count,
+    received_transfer_count,
+    net_amount_native_sum,
+    gross_amount_native_sum
+  from token_daily_address_flows
+  where token_address = '${escapeSqlString(address)}'
+    and day = date '${escapeSqlString(day)}'
+    and ${direction === "in" ? "net_amount_native_sum > 0" : "net_amount_native_sum < 0"}
+  order by
+    ${direction === "in" ? "net_amount_native_sum desc" : "net_amount_native_sum asc"},
+    gross_amount_native_sum desc,
+    address asc
+  limit 10
+`;
+
 const inspectToken = async ({
   connection,
   token,
@@ -178,6 +212,14 @@ const inspectToken = async ({
     connection,
     topFlowsSql({ address: resolved.address, direction: "recipient", day: summary.last_day }),
   );
+  const topNetInflows = await rows<NetFlowRow>(
+    connection,
+    topNetFlowsSql({ address: resolved.address, direction: "in", day: summary.last_day }),
+  );
+  const topNetOutflows = await rows<NetFlowRow>(
+    connection,
+    topNetFlowsSql({ address: resolved.address, direction: "out", day: summary.last_day }),
+  );
 
   console.log("token:");
   console.table([resolved]);
@@ -189,6 +231,10 @@ const inspectToken = async ({
   console.table(topSenders);
   console.log(`top recipients on ${summary.last_day}:`);
   console.table(topRecipients);
+  console.log(`top net inflows on ${summary.last_day}:`);
+  console.table(topNetInflows);
+  console.log(`top net outflows on ${summary.last_day}:`);
+  console.table(topNetOutflows);
 };
 
 const main = async () => {
