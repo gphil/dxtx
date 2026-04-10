@@ -218,14 +218,13 @@ const createTokenManifestTableSql = `
   create table if not exists token_manifest (
     chain varchar,
     address varchar,
-    source varchar,
-    token_name varchar,
-    token_symbol varchar,
-    token_decimals integer,
     target_source varchar,
     coingecko_id varchar,
     coingecko_name varchar,
-    coingecko_symbol varchar
+    coingecko_symbol varchar,
+    token_name varchar,
+    token_symbol varchar,
+    token_decimals integer
   )
 `;
 
@@ -345,8 +344,28 @@ const manifestTableSql = ({ manifestUri }: { manifestUri: string }) => `
 
 const replaceTokenManifestSql = `
   delete from token_manifest;
-  insert into token_manifest
-  select * from source_token_manifest;
+  insert into token_manifest (
+    chain,
+    address,
+    target_source,
+    coingecko_id,
+    coingecko_name,
+    coingecko_symbol,
+    token_name,
+    token_symbol,
+    token_decimals
+  )
+  select
+    chain,
+    address,
+    target_source,
+    coingecko_id,
+    coingecko_name,
+    coingecko_symbol,
+    token_name,
+    token_symbol,
+    token_decimals
+  from source_token_manifest;
 `;
 
 const sourceDaysTokensSql = `
