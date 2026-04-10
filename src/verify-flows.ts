@@ -132,6 +132,15 @@ type ExactAggregate = {
   netAmountRaw: bigint;
 };
 
+type RpcVerificationRow = {
+  transfer: RawTransferRow;
+  ok: boolean;
+  rpc_from_address?: string;
+  rpc_to_address?: string;
+  rpc_amount_raw?: string;
+  error?: string;
+};
+
 const tokenLookupSql = (token: string) => {
   const value = escapeSqlString(token.toLowerCase());
   const addressMatch = token.startsWith("0x") ? `lower(address) = '${value}'` : "false";
@@ -245,6 +254,41 @@ const exactAggregate = (address: string, transfers: RawTransferRow[]): ExactAggr
   );
 
 const decodeTopicAddress = (topic: string) => `0x${topic.slice(topic.length - 40).toLowerCase()}`;
+const toNativeNumber = (amountRaw: bigint, decimals: number) => Number(formatUnitsText(amountRaw.toString(), decimals));
+const amountTolerance = (expected: number, decimals: number) =>
+  Math.max(10 ** -Math.min(decimals, 6), Math.abs(expected) * 1e-12);
+
+const analyticsMatchesExact = ({
+  analytics,
+  exact,
+  decimals,
+}: {
+  analytics: AnalyticsFlowRow | undefined;
+  exact: ExactAggregate;
+  decimals: number;
+}) => {
+  if (!analytics) {
+    return false;
+  }
+
+  const expectedSent = toNativeNumber(exact.sentAmountRaw, decimals);
+  const expectedReceived = toNativeNumber(exact.receivedAmountRaw, decimals);
+  const expectedGross = toNativeNumber(exact.grossAmountRaw, decimals);
+  const expectedNet = toNativeNumber(exact.netAmountRaw, decimals);
+
+  const matchesAmount = (actual: number, expected: number) =>
+    Math.abs(actual - expected) <= amountTolerance(expected, decimals);
+
+  return (
+    toCount(analytics.sent_transfer_count) === exact.sentTransferCount &&
+    toCount(analytics.received_transfer_count) === exact.receivedTransferCount &&
+    toCount(analytics.total_transfer_count) === exact.totalTransferCount &&
+    matchesAmount(analytics.sent_amount_native_sum, expectedSent) &&
+    matchesAmount(analytics.received_amount_native_sum, expectedReceived) &&
+    matchesAmount(analytics.gross_amount_native_sum, expectedGross) &&
+    matchesAmount(analytics.net_amount_native_sum, expectedNet)
+  );
+};
 
 const resolveBlockRange = async ({
   chain,
@@ -295,7 +339,7 @@ const verifyTransfersWithRpc = ({
   tokenAddress: string;
   transfers: RawTransferRow[];
   receiptsByHash: Map<string, RpcReceipt>;
-}) =>
+}): RpcVerificationRow[] =>
   transfers.map((transfer) => {
     const receipt = receiptsByHash.get(transfer.transaction_hash);
 
@@ -333,6 +377,9 @@ const verifyTransfersWithRpc = ({
     return {
       transfer,
       ok,
+      rpc_from_address: fromAddress,
+      rpc_to_address: toAddress,
+      rpc_amount_raw: amountRaw,
       ...(ok
         ? {}
         : {
@@ -351,6 +398,27 @@ const formatExactAggregate = (aggregate: ExactAggregate, decimals: number) => ({
   net_amount_native_exact: formatUnitsText(aggregate.netAmountRaw.toString(), decimals),
 });
 
+const formatAnalyticsAggregate = (analytics: AnalyticsFlowRow | undefined) =>
+  analytics
+    ? {
+        sent_transfer_count: toCount(analytics.sent_transfer_count),
+        received_transfer_count: toCount(analytics.received_transfer_count),
+        total_transfer_count: toCount(analytics.total_transfer_count),
+        sent_amount_native_sum: analytics.sent_amount_native_sum,
+        received_amount_native_sum: analytics.received_amount_native_sum,
+        gross_amount_native_sum: analytics.gross_amount_native_sum,
+        net_amount_native_sum: analytics.net_amount_native_sum,
+      }
+    : {
+        sent_transfer_count: null,
+        received_transfer_count: null,
+        total_transfer_count: null,
+        sent_amount_native_sum: null,
+        received_amount_native_sum: null,
+        gross_amount_native_sum: null,
+        net_amount_native_sum: null,
+      };
+
 const printVerification = ({
   token,
   day,
@@ -358,7 +426,7 @@ const printVerification = ({
   analytics,
   exact,
   transfers,
-  failures,
+  verification,
 }: {
   token: TokenRow;
   day: string;
@@ -366,49 +434,53 @@ const printVerification = ({
   analytics: AnalyticsFlowRow | undefined;
   exact: ExactAggregate;
   transfers: RawTransferRow[];
-  failures: Array<{ transfer: RawTransferRow; ok: boolean; error?: string }>;
+  verification: RpcVerificationRow[];
 }) => {
-  console.log(`verification chain=${token.chain} token=${token.token_symbol} day=${day} address=${address}`);
-  console.log("analytics:");
-  console.table(
-    analytics
-      ? [
-          {
-            sent_transfer_count: toCount(analytics.sent_transfer_count),
-            received_transfer_count: toCount(analytics.received_transfer_count),
-            total_transfer_count: toCount(analytics.total_transfer_count),
-            sent_amount_native_sum: analytics.sent_amount_native_sum,
-            received_amount_native_sum: analytics.received_amount_native_sum,
-            gross_amount_native_sum: analytics.gross_amount_native_sum,
-            net_amount_native_sum: analytics.net_amount_native_sum,
-          },
-        ]
-      : [],
+  const analyticsOk = analyticsMatchesExact({
+    analytics,
+    exact,
+    decimals: token.token_decimals,
+  });
+  const rpcFailures = verification.filter((row) => !row.ok);
+  const rpcOk = rpcFailures.length === 0;
+  const passed = analyticsOk && rpcOk;
+  const status = passed ? "verification passed - rpc matched" : "verification failed";
+  const reasons = [analyticsOk ? undefined : "index aggregate mismatch", rpcOk ? undefined : "rpc mismatch"]
+    .filter(Boolean)
+    .join(", ");
+
+  console.log(
+    `${status} chain=${token.chain} token=${token.token_symbol} day=${day} address=${address}` +
+      (reasons ? ` reason=${reasons}` : "") +
+      ` logs=${transfers.length}`,
   );
-  console.log("exact:");
+
+  if (passed) {
+    return;
+  }
+
+  console.log("index aggregate:");
+  console.table([formatAnalyticsAggregate(analytics)]);
+  console.log("exact aggregate from cached transfers:");
   console.table([formatExactAggregate(exact, token.token_decimals)]);
-  console.log("raw transfers:");
-  console.table(
-    transfers.map((transfer) => ({
-      block_number: Number(transfer.block_number),
-      transaction_hash: transfer.transaction_hash,
-      log_index: transfer.log_index,
-      from_address: transfer.from_address,
-      to_address: transfer.to_address,
-      amount_text: transfer.amount_text,
-    })),
-  );
-  console.log("rpc verification:");
-  console.table(
-    failures.length === 0
-      ? [{ ok: 1, verified_logs: transfers.length }]
-      : failures.map(({ transfer, error }) => ({
-          ok: 0,
-          transaction_hash: transfer.transaction_hash,
-          log_index: transfer.log_index,
-          error,
-        })),
-  );
+
+  if (!rpcOk) {
+    console.log("rpc mismatch details:");
+    console.table(
+      rpcFailures.map(({ transfer, error, rpc_from_address, rpc_to_address, rpc_amount_raw }) => ({
+        transaction_hash: transfer.transaction_hash,
+        log_index: transfer.log_index,
+        index_from_address: transfer.from_address,
+        rpc_from_address,
+        index_to_address: transfer.to_address,
+        rpc_to_address,
+        index_amount_text: transfer.amount_text,
+        rpc_amount_text:
+          rpc_amount_raw === undefined ? undefined : formatUnitsText(rpc_amount_raw, token.token_decimals),
+        error,
+      })),
+    );
+  }
 };
 
 const main = async () => {
@@ -477,11 +549,11 @@ const main = async () => {
       );
       const analytics = analyticsRows.find((row) => row.address === address);
       const exact = exactAggregate(address, addressTransfers);
-      const failures = verifyTransfersWithRpc({
+      const verification = verifyTransfersWithRpc({
         tokenAddress: resolvedToken.address,
         transfers: addressTransfers,
         receiptsByHash,
-      }).filter((row) => !row.ok);
+      });
 
       printVerification({
         token: resolvedToken,
@@ -490,7 +562,7 @@ const main = async () => {
         analytics,
         exact,
         transfers: addressTransfers,
-        failures,
+        verification,
       });
     });
   } finally {
