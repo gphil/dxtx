@@ -1083,6 +1083,7 @@ const createServingSchemaSql = `
   set network = ${normalizedNetworkSql("network")}
   where network in (${legacyNetworkValuesSql});
 `;
+const servingSchemaLockKey = 20_260_410;
 
 const insertRowsSql = ({
   table,
@@ -1184,7 +1185,6 @@ const exportToPostgres = async ({
 
   try {
     await client.query("begin");
-    await client.query(createServingSchemaSql);
 
     if (dailyTotals.length > 0) {
       const columns = [
@@ -1280,8 +1280,12 @@ const ensurePostgresSchema = async () => {
   await client.connect();
 
   try {
+    await client.query("select pg_advisory_lock($1)", [servingSchemaLockKey]);
     await client.query(createServingSchemaSql);
   } finally {
+    await client
+      .query("select pg_advisory_unlock($1)", [servingSchemaLockKey])
+      .catch(() => undefined);
     await client.end();
   }
 };
