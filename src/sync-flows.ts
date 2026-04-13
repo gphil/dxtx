@@ -39,6 +39,9 @@ const normalizedNetworkSql = (column: string) => `
     else ${column}
   end
 `;
+const normalizeEnvName = (chain: Chain) => chain.toUpperCase();
+const chainEnvValue = (baseKey: string, chain: Chain) =>
+  process.env[`${baseKey}_${normalizeEnvName(chain)}`] ?? process.env[baseKey];
 
 const assertEnv = (value: string | undefined, key: string) => {
   if (!value) {
@@ -144,8 +147,8 @@ const configureDuckDb = async ({
   connection: DuckDBConnection;
   chain: Chain;
 }) => {
-  const memoryLimit = envValue("ANALYTICS_MEMORY_LIMIT") || "4GB";
-  const threads = envValue("ANALYTICS_THREADS");
+  const memoryLimit = chainEnvValue("ANALYTICS_MEMORY_LIMIT", chain) || "4GB";
+  const threads = chainEnvValue("ANALYTICS_THREADS", chain);
   const tempDir = tempDirectory(chain);
 
   await mkdir(tempDir, { recursive: true });
@@ -1338,9 +1341,9 @@ const syncPass = async ({
   chain: Chain;
 }): Promise<SyncPassResult> => {
   const reset = envFlag("FLOW_SYNC_RESET");
-  const maxChunks = Number.parseInt(envValue("FLOW_SYNC_MAX_CHUNKS") || "32", 10);
-  const fromDay = envValue("FLOW_SYNC_FROM_DAY");
-  const toDay = envValue("FLOW_SYNC_TO_DAY");
+  const maxChunks = Number.parseInt(chainEnvValue("FLOW_SYNC_MAX_CHUNKS", chain) || "32", 10);
+  const fromDay = chainEnvValue("FLOW_SYNC_FROM_DAY", chain);
+  const toDay = chainEnvValue("FLOW_SYNC_TO_DAY", chain);
 
   if (reset) {
     logLine("resetting local flow sync state", { chain });
@@ -1378,6 +1381,12 @@ const syncPass = async ({
     const latestDay = await selectLatestTotalsDay(connection);
     const network = networkName(chain);
     const exportedLatestDay = latestDay === null ? null : await selectPostgresLatestTotalsDay(network);
+
+    logLine("flow sync idle", {
+      chain,
+      latest_day: latestDay ?? undefined,
+      exported_latest_day: exportedLatestDay ?? undefined,
+    });
 
     if (latestDay !== null && exportedLatestDay !== latestDay) {
       logLine("repairing postgres flow export", {

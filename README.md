@@ -137,6 +137,10 @@ sqd process:all
   local DuckDB path for the incremental flow sync worker; defaults to `./analytics/<chain>-flow-sync.duckdb`
 - `FLOW_SYNC_MAX_CHUNKS`
   max number of new cache chunks to process per sync pass; defaults to `32`
+- `ANALYTICS_MEMORY_LIMIT`
+  DuckDB memory cap for flow sync workers; defaults to `4GB`
+- `ANALYTICS_THREADS`
+  DuckDB thread count for flow sync workers
 - `FLOW_SYNC_LOOP`
   when `true`, keep polling for new chunks instead of running a single sync pass
 - `FLOW_SYNC_INTERVAL_SEC`
@@ -159,6 +163,9 @@ Per-chain overrides use the same suffix pattern:
 - `CACHE_TO_BLOCK_ARBITRUM`
 - `CACHE_CHUNK_SIZE_MB_BASE`
 - `CACHE_TARGET_LIMIT_BASE`
+- `FLOW_SYNC_MAX_CHUNKS_BSC`
+- `ANALYTICS_MEMORY_LIMIT_BSC`
+- `ANALYTICS_THREADS_BSC`
 
 ## Output
 
