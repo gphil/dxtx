@@ -212,6 +212,19 @@ const runChain = async (chain: Chain, sharedMetadataPath: string) => {
   }
 };
 
+const runChainOrFail = async (chain: Chain, sharedMetadataPath: string) => {
+  try {
+    await runChain(chain, sharedMetadataPath);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logLine("chain publisher failed", {
+      chain,
+      error: message,
+    });
+    throw error;
+  }
+};
+
 const runnableChains = (chains: Chain[]) =>
   chains.filter((chain) => {
     try {
@@ -244,22 +257,7 @@ const main = async () => {
   });
 
   try {
-    const results = await Promise.allSettled(chains.map((chain) => runChain(chain, sharedMetadataPath)));
-    const failures = results.flatMap((result, index) =>
-      result.status === "rejected"
-        ? [{ chain: chains[index], error: result.reason instanceof Error ? result.reason.message : String(result.reason) }]
-        : [],
-    );
-
-    if (failures.length > 0) {
-      failures.forEach((failure) =>
-        logLine("chain publisher failed", {
-          chain: failure.chain,
-          error: failure.error,
-        }),
-      );
-      throw new Error(`failed chain publishers: ${failures.map((failure) => failure.chain).join(",")}`);
-    }
+    await Promise.all(chains.map((chain) => runChainOrFail(chain, sharedMetadataPath)));
   } finally {
     await rm(sharedMetadataPath, { force: true }).catch(() => undefined);
     await rm(dirname(sharedMetadataPath), { recursive: true, force: true }).catch(() => undefined);
