@@ -183,6 +183,7 @@ Resume is cache-first. The publisher resumes from the last flushed transfer chun
 - Run `sync:flows` against a separate local DuckDB database on the indexer box.
 - Run a local Dockerized Postgres for serving tables with `npm run db:up`.
 - Let `npm run sync:flows` fan out to one worker per selected chain in loop mode, with each chain keeping its own local DuckDB file.
+- In loop mode, failed flow-sync workers are restarted automatically, and DuckDB OOM failures back off to smaller chunk batches automatically.
 - Let `sync:flows` process only new parquet chunks and maintain:
   - `processed_flow_chunks`
   - `token_daily_totals`

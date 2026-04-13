@@ -10,8 +10,24 @@ const currentDir = dirname(fileURLToPath(import.meta.url));
 const workerEntryPath = join(currentDir, "..", "sync-flows.js");
 const maxRecentLines = 20;
 const restartScheduleMs = [5_000, 10_000, 30_000, 60_000, 120_000];
+const oomPattern = /Out of Memory Error|could not allocate block/i;
 const restartDelayMs = (attempt: number) =>
   restartScheduleMs[Math.min(attempt, restartScheduleMs.length - 1)] ?? 120_000;
+const normalizeEnvName = (chain: Chain) => chain.toUpperCase();
+const chainEnvKey = (baseKey: string, chain: Chain) => `${baseKey}_${normalizeEnvName(chain)}`;
+const parsePositiveInt = (value: string | undefined) => {
+  const parsed = Number.parseInt(value || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+};
+const configuredMaxChunks = (chain: Chain) =>
+  parsePositiveInt(process.env[chainEnvKey("FLOW_SYNC_MAX_CHUNKS", chain)] ?? process.env.FLOW_SYNC_MAX_CHUNKS) ?? 32;
+const configuredThreads = (chain: Chain) =>
+  parsePositiveInt(process.env[chainEnvKey("ANALYTICS_THREADS", chain)] ?? process.env.ANALYTICS_THREADS);
+
+type WorkerOverrides = {
+  maxChunks?: number;
+  threads?: number;
+};
 
 const splitArgs = (values: string[]) =>
   values.flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean);
@@ -98,14 +114,34 @@ type ChildExit = {
 
 const recentFailureLine = (recentLines: string[]) => [...recentLines].reverse()[0];
 
-const runChainOnce = (chain: Chain) =>
+const childEnv = (chain: Chain, overrides: WorkerOverrides) => ({
+  ...process.env,
+  ...(overrides.maxChunks === undefined
+    ? {}
+    : { [chainEnvKey("FLOW_SYNC_MAX_CHUNKS", chain)]: String(overrides.maxChunks) }),
+  ...(overrides.threads === undefined
+    ? {}
+    : { [chainEnvKey("ANALYTICS_THREADS", chain)]: String(overrides.threads) }),
+});
+
+const nextOverridesOnOom = (chain: Chain, overrides: WorkerOverrides): WorkerOverrides => {
+  const currentMaxChunks = overrides.maxChunks ?? configuredMaxChunks(chain);
+  const currentThreads = overrides.threads ?? configuredThreads(chain) ?? 1;
+
+  return {
+    maxChunks: Math.max(1, Math.floor(currentMaxChunks / 2)),
+    threads: currentThreads > 1 ? 1 : currentThreads,
+  };
+};
+
+const runChainOnce = (chain: Chain, overrides: WorkerOverrides = {}) =>
   new Promise<ChildExit>((resolve, reject) => {
     const child = spawn(
       process.execPath,
       ["--require=dotenv/config", workerEntryPath, chain],
       {
         cwd: process.cwd(),
-        env: process.env,
+        env: childEnv(chain, overrides),
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
@@ -134,13 +170,21 @@ const runChain = async (chain: Chain) => {
 
 const runChainLoop = async (chain: Chain) => {
   let restartCount = 0;
+  let overrides: WorkerOverrides = {};
 
   while (true) {
-    const result = await runChainOnce(chain);
+    const result = await runChainOnce(chain, overrides);
 
     if (result.signal === "SIGINT" || result.signal === "SIGTERM") {
       return;
     }
+
+    const nextOverrides = oomPattern.test(result.recentLines.join("\n"))
+      ? nextOverridesOnOom(chain, overrides)
+      : overrides;
+    const overridesChanged =
+      nextOverrides.maxChunks !== overrides.maxChunks || nextOverrides.threads !== overrides.threads;
+    overrides = nextOverrides;
 
     const backoffMs = restartDelayMs(restartCount);
     restartCount += 1;
@@ -152,6 +196,9 @@ const runChainLoop = async (chain: Chain) => {
       exit_code: result.code ?? undefined,
       signal: result.signal ?? undefined,
       error: recentFailureLine(result.recentLines),
+      auto_max_chunks: overrides.maxChunks,
+      auto_threads: overrides.threads,
+      oom_backoff: overridesChanged ? 1 : undefined,
     });
 
     await sleep(backoffMs);
