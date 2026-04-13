@@ -892,6 +892,10 @@ type LatestDayRow = {
   latest_day: string | null;
 };
 
+type LatestExportDayRow = {
+  latest_day: string | null;
+};
+
 type TokenExportRow = {
   token_address: string;
 };
@@ -1290,6 +1294,28 @@ const ensurePostgresSchema = async () => {
   }
 };
 
+const selectPostgresLatestTotalsDay = async (network: Network) => {
+  const databaseUrl = postgresConnectionString();
+
+  if (!databaseUrl) {
+    return null;
+  }
+
+  const client = new Client({ connectionString: databaseUrl });
+
+  await client.connect();
+
+  try {
+    const result = await client.query<LatestExportDayRow>(
+      "select cast(max(day) as text) as latest_day from token_flow_daily_totals where network = $1",
+      [network],
+    );
+    return result.rows[0]?.latest_day ?? null;
+  } finally {
+    await client.end();
+  }
+};
+
 const resetLocalState = async (connection: DuckDBConnection) => {
   await run(connection, "drop table if exists processed_flow_chunks");
   await run(connection, "drop table if exists token_manifest");
@@ -1349,6 +1375,24 @@ const syncPass = async ({
   });
 
   if (selectedChunks.length === 0) {
+    const latestDay = await selectLatestTotalsDay(connection);
+    const network = networkName(chain);
+    const exportedLatestDay = latestDay === null ? null : await selectPostgresLatestTotalsDay(network);
+
+    if (latestDay !== null && exportedLatestDay !== latestDay) {
+      logLine("repairing postgres flow export", {
+        chain,
+        latest_day: latestDay,
+        exported_latest_day: exportedLatestDay ?? undefined,
+      });
+      await exportToPostgres({
+        connection,
+        chain,
+        fullRebuild: true,
+        latestDay,
+      });
+    }
+
     return {
       processedChunks: 0,
       remainingChunks: 0,
