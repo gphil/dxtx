@@ -118,6 +118,7 @@ const nextDay = (value: string) =>
   new Date(Date.parse(`${value}T00:00:00Z`) + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
 const dayTimestamp = (value: string) => Math.floor(Date.parse(`${value}T00:00:00Z`) / 1_000);
+const isBeforeDay = (left: string, right: string) => left.localeCompare(right) < 0;
 
 const sqlStringList = (values: string[]) =>
   `[${values.map((value) => `'${escapeSqlString(value)}'`).join(", ")}]`;
@@ -1162,11 +1163,13 @@ const exportToPostgres = async ({
   connection,
   chain,
   fullRebuild,
+  includeLeaderboards,
   latestDay,
 }: {
   connection: DuckDBConnection;
   chain: Chain;
   fullRebuild: boolean;
+  includeLeaderboards: boolean;
   latestDay: string;
 }) => {
   const databaseUrl = postgresConnectionString();
@@ -1181,11 +1184,16 @@ const exportToPostgres = async ({
     connection,
     dailyTotalsExportSql({ asOfTs, latestDay, fullRebuild, network }),
   );
-  const leaderboards = await rows<LeaderboardExportRow>(
-    connection,
-    leaderboardExportSql({ asOfTs, fullRebuild, network }),
-  );
-  const affectedTokens = fullRebuild ? [] : await rows<TokenExportRow>(connection, affectedTokensSql);
+  const leaderboards = includeLeaderboards
+    ? await rows<LeaderboardExportRow>(
+        connection,
+        leaderboardExportSql({ asOfTs, fullRebuild, network }),
+      )
+    : [];
+  const affectedTokens =
+    includeLeaderboards && !fullRebuild
+      ? await rows<TokenExportRow>(connection, affectedTokensSql)
+      : [];
   const client = new Client({ connectionString: databaseUrl });
 
   await client.connect();
@@ -1217,14 +1225,16 @@ const exportToPostgres = async ({
       }
     }
 
-    await deleteAffectedLeaderboardRows({
-      client,
-      network,
-      tokens: affectedTokens,
-      fullRebuild,
-    });
+    if (includeLeaderboards) {
+      await deleteAffectedLeaderboardRows({
+        client,
+        network,
+        tokens: affectedTokens,
+        fullRebuild,
+      });
+    }
 
-    if (leaderboards.length > 0) {
+    if (includeLeaderboards && leaderboards.length > 0) {
       const columns = [
         "network",
         "token_address",
@@ -1264,7 +1274,8 @@ const exportToPostgres = async ({
     logLine("published flows to postgres", {
       chain,
       daily_rows: dailyTotals.length,
-      leaderboard_rows: leaderboards.length,
+      leaderboard_rows: includeLeaderboards ? leaderboards.length : undefined,
+      deferred_leaderboards: includeLeaderboards ? undefined : 1,
       full_rebuild: fullRebuild ? 1 : undefined,
     });
   } catch (error) {
@@ -1398,6 +1409,7 @@ const syncPass = async ({
         connection,
         chain,
         fullRebuild: true,
+        includeLeaderboards: true,
         latestDay,
       });
     }
@@ -1432,6 +1444,7 @@ const syncPass = async ({
   await run(connection, markProcessedChunksSql(chain, selectedChunks));
 
   const latestDay = await selectLatestTotalsDay(connection);
+  const remainingChunks = Math.max(0, unprocessedChunks.length - selectedChunks.length);
 
   if (!latestDay) {
     throw new Error(`no latest day found after flow sync for ${chain}`);
@@ -1440,33 +1453,45 @@ const syncPass = async ({
   const currentDay = new Date().toISOString().slice(0, 10);
   const previousLeaderboardDay = await selectLatestLeaderboardDay(connection);
   const fullRebuild = previousLeaderboardDay !== latestDay;
+  const includeLeaderboards = !(fullRebuild && remainingChunks > 0 && isBeforeDay(latestDay, currentDay));
 
-  await run(
-    connection,
-    refreshLeaderboardsSql({
-      latestDay,
-      currentDay,
-      fullRebuild,
-    }),
-  );
+  if (includeLeaderboards) {
+    await run(
+      connection,
+      refreshLeaderboardsSql({
+        latestDay,
+        currentDay,
+        fullRebuild,
+      }),
+    );
+  } else {
+    logLine("deferred flow leaderboard export", {
+      chain,
+      latest_day: latestDay,
+      remaining_chunks: remainingChunks,
+    });
+  }
+
   await exportToPostgres({
     connection,
     chain,
     fullRebuild,
+    includeLeaderboards,
     latestDay,
   });
 
   logLine("completed flow sync pass", {
     chain,
     processed_chunks: selectedChunks.length,
-    remaining_chunks: Math.max(0, unprocessedChunks.length - selectedChunks.length),
+    remaining_chunks: remainingChunks,
     latest_day: latestDay,
+    deferred_leaderboards: includeLeaderboards ? undefined : 1,
     full_rebuild: fullRebuild ? 1 : undefined,
   });
 
   return {
     processedChunks: selectedChunks.length,
-    remainingChunks: Math.max(0, unprocessedChunks.length - selectedChunks.length),
+    remainingChunks,
   };
 };
 
