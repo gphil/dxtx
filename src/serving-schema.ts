@@ -156,6 +156,21 @@ const createServingSchemaSql = `
   create index if not exists idx_address_labels_raw_source_name
     on address_labels_raw (source_name, source_recorded_at desc);
 
+  create table if not exists address_label_source_checks (
+    source_name text not null,
+    network text not null,
+    address text not null,
+    status text not null,
+    source_uri text,
+    metadata jsonb not null default '{}'::jsonb,
+    checked_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    primary key (source_name, network, address)
+  );
+
+  create index if not exists idx_address_label_source_checks_source_name
+    on address_label_source_checks (source_name, checked_at desc);
+
   create table if not exists address_labels (
     network text not null,
     address text not null,

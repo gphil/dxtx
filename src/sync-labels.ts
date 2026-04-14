@@ -22,6 +22,7 @@ import {
   normalizeNetwork,
   parseArgValue,
   parseBool,
+  parseIntegerArg,
   readTextFile,
 } from "./serving.js";
 import { ensureServingSchema } from "./serving-schema.js";
@@ -45,6 +46,17 @@ type RawAddressLabelRow = {
   source_recorded_at: Date | null;
   external_added_at: Date | null;
   inserted_at: Date;
+  updated_at: Date;
+};
+
+type AddressLabelSourceCheckRow = {
+  source_name: string;
+  network: string;
+  address: string;
+  status: string;
+  source_uri: string | null;
+  metadata: Record<string, unknown>;
+  checked_at: Date;
   updated_at: Date;
 };
 
@@ -89,6 +101,24 @@ const supportedSupersetChains = new Set([
   "ink",
 ]);
 
+const zeroAddress = "0x0000000000000000000000000000000000000000";
+const sourcifySourceName = "sourcify_verified_contracts";
+const sourcifyBaseUrl = "https://sourcify.dev/server/v2/contract";
+
+const sourcifyChainIdByNetwork: Record<string, string> = {
+  eth: "1",
+  base: "8453",
+  polygon: "137",
+  arbitrum: "42161",
+  bsc: "56",
+  optimism: "10",
+  avalanche: "43114",
+  zora: "7777777",
+  unichain: "130",
+  blast: "81457",
+  ink: "57073",
+};
+
 const priorityCaseSql = `
   case
     when source_name = 'eigen_manual_labels' then 10
@@ -104,6 +134,7 @@ const priorityCaseSql = `
     when source_name = 'eigen_cex_labels' then 50
     when source_name = 'eigen_etherscan_labels' then 60
     when source_name = 'eth_labels' then 65
+    when source_name = 'sourcify_verified_contracts' then 68
     when source_name = 'eigen_names' then 70
     when source_name = 'dune_uploaded_ens_labels' then 80
     else 100
@@ -317,6 +348,57 @@ const buildRawLabel = ({
     inserted_at: now,
     updated_at: now,
   } satisfies RawAddressLabelRow;
+};
+
+const buildSourceCheck = ({
+  sourceName,
+  network,
+  address,
+  status,
+  sourceUri,
+  metadata,
+}: {
+  sourceName: string;
+  network: string;
+  address: string;
+  status: string;
+  sourceUri: string | null;
+  metadata: Record<string, unknown>;
+}) => {
+  const now = new Date();
+  return {
+    source_name: sourceName,
+    network,
+    address,
+    status,
+    source_uri: sourceUri,
+    metadata,
+    checked_at: now,
+    updated_at: now,
+  } satisfies AddressLabelSourceCheckRow;
+};
+
+type SourcifyContractResponse = {
+  matchId?: string | null;
+  match?: string | null;
+  creationMatch?: string | null;
+  runtimeMatch?: string | null;
+  verifiedAt?: string | null;
+  chainId?: string | null;
+  address?: string | null;
+  compilation?: {
+    name?: string | null;
+    fullyQualifiedName?: string | null;
+    language?: string | null;
+    compiler?: string | null;
+    compilerVersion?: string | null;
+  } | null;
+};
+
+type SourcifyLookupResult = {
+  row: RawAddressLabelRow | null;
+  check: AddressLabelSourceCheckRow | null;
+  status: "found" | "not_found" | "missing_label" | "error";
 };
 
 const ethLabelsChainMap: Record<string, string> = {
@@ -1236,6 +1318,312 @@ const loadUploadedDuneRows = async ({
   return groups.flat();
 };
 
+const parseIntegerSetting = ({
+  argName,
+  envName,
+  fallback,
+}: {
+  argName: string;
+  envName: string;
+  fallback: number;
+}) => {
+  const argValue = parseIntegerArg(argName);
+
+  if (argValue !== null && Number.isFinite(argValue)) {
+    return argValue;
+  }
+
+  const envValue = cleanText(process.env[envName]);
+  const parsedEnvValue = envValue ? Number.parseInt(envValue, 10) : Number.NaN;
+  return Number.isFinite(parsedEnvValue) ? parsedEnvValue : fallback;
+};
+
+const sourcifySettings = () => ({
+  limit: Math.max(
+    0,
+    parseIntegerSetting({
+      argName: "sourcify-limit",
+      envName: "SOURCIFY_LOOKUP_LIMIT",
+      fallback: 500,
+    }),
+  ),
+  recheckDays: Math.max(
+    0,
+    parseIntegerSetting({
+      argName: "sourcify-recheck-days",
+      envName: "SOURCIFY_RECHECK_DAYS",
+      fallback: 30,
+    }),
+  ),
+  concurrency: Math.max(
+    1,
+    parseIntegerSetting({
+      argName: "sourcify-concurrency",
+      envName: "SOURCIFY_CONCURRENCY",
+      fallback: 8,
+    }),
+  ),
+});
+
+const sourcifyContractLabel = (payload: SourcifyContractResponse) =>
+  cleanText(payload.compilation?.name) ||
+  cleanText(payload.compilation?.fullyQualifiedName)?.split(":").pop()?.trim() ||
+  null;
+
+const sourcifyMetadata = ({
+  network,
+  chainId,
+  payload,
+}: {
+  network: string;
+  chainId: string;
+  payload: SourcifyContractResponse;
+}) => ({
+  network,
+  chain_id: chainId,
+  match_id: cleanText(payload.matchId),
+  match: cleanText(payload.match),
+  creation_match: cleanText(payload.creationMatch),
+  runtime_match: cleanText(payload.runtimeMatch),
+  verified_at: cleanText(payload.verifiedAt),
+  compilation_name: cleanText(payload.compilation?.name),
+  fully_qualified_name: cleanText(payload.compilation?.fullyQualifiedName),
+  language: cleanText(payload.compilation?.language),
+  compiler: cleanText(payload.compilation?.compiler),
+  compiler_version: cleanText(payload.compilation?.compilerVersion),
+});
+
+const sourcifySourceUri = (chainId: string, address: string) =>
+  `${sourcifyBaseUrl}/${chainId}/${address}?fields=compilation,verifiedAt,creationMatch,runtimeMatch`;
+
+const listSourcifyCandidates = async ({
+  client,
+  limit,
+  recheckDays,
+}: {
+  client: ReturnType<typeof createServingClient>;
+  limit: number;
+  recheckDays: number;
+}) => {
+  if (limit <= 0) {
+    return [] as Array<{ network: string; address: string }>;
+  }
+
+  const result = await client.query<{ network: string; address: string }>(
+    `
+      with candidate_rows as (
+        select
+          leaderboards.network,
+          leaderboards.address,
+          min(leaderboards.flow_rank) as best_flow_rank,
+          count(*)::bigint as row_count,
+          sum(abs(leaderboards.amount_native_sum) * coalesce(prices.median_price_usd, 0)) as estimated_usd
+        from token_flow_leaderboards as leaderboards
+        left join token_price_daily as prices
+          on prices.network = leaderboards.network
+         and prices.token_address = leaderboards.token_address
+         and prices.day = leaderboards.window_end_day
+        left join address_labels
+          on address_labels.network = leaderboards.network
+         and address_labels.address = leaderboards.address
+        left join address_label_source_checks as checks
+          on checks.source_name = $1
+         and checks.network = leaderboards.network
+         and checks.address = leaderboards.address
+        where leaderboards.address <> $2
+          and leaderboards.metric in ('net_inflow', 'net_outflow')
+          and address_labels.address is null
+          and (checks.checked_at is null or checks.checked_at < now() - $3::interval)
+        group by leaderboards.network, leaderboards.address
+      )
+      select network, address
+      from candidate_rows
+      order by estimated_usd desc nulls last, best_flow_rank asc, row_count desc, network asc, address asc
+      limit $4
+    `,
+    [sourcifySourceName, zeroAddress, `${recheckDays} days`, limit],
+  );
+
+  return result.rows.flatMap((row) =>
+    sourcifyChainIdByNetwork[row.network]
+      ? [
+          {
+            network: row.network,
+            address: row.address,
+          },
+        ]
+      : [],
+  );
+};
+
+const fetchSourcifyContract = async ({
+  network,
+  address,
+}: {
+  network: string;
+  address: string;
+}): Promise<SourcifyLookupResult> => {
+  const chainId = sourcifyChainIdByNetwork[network];
+
+  if (!chainId) {
+    return {
+      row: null,
+      check: null,
+      status: "error",
+    };
+  }
+
+  const sourceUri = sourcifySourceUri(chainId, address);
+  const maxAttempts = 3;
+
+  for (const attempt of Array.from({ length: maxAttempts }, (_, index) => index + 1)) {
+    try {
+      const response = await fetch(sourceUri, {
+        headers: { accept: "application/json" },
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (response.status === 404) {
+        return {
+          row: null,
+          check: buildSourceCheck({
+            sourceName: sourcifySourceName,
+            network,
+            address,
+            status: "not_found",
+            sourceUri,
+            metadata: { chain_id: chainId, http_status: 404 },
+          }),
+          status: "not_found",
+        };
+      }
+
+      if (!response.ok) {
+        throw new Error(`unexpected_status_${response.status}`);
+      }
+
+      const payload = (await response.json()) as SourcifyContractResponse;
+      const label = sourcifyContractLabel(payload);
+
+      if (!label) {
+        return {
+          row: null,
+          check: buildSourceCheck({
+            sourceName: sourcifySourceName,
+            network,
+            address,
+            status: "missing_label",
+            sourceUri,
+            metadata: sourcifyMetadata({ network, chainId, payload }),
+          }),
+          status: "missing_label",
+        };
+      }
+
+      const metadata = sourcifyMetadata({ network, chainId, payload });
+      const confidence =
+        cleanText(payload.runtimeMatch) === "match" ? 0.82 : cleanText(payload.creationMatch) === "match" ? 0.78 : 0.74;
+
+      return {
+        row: buildRawLabel({
+          network,
+          address,
+          sourceName: sourcifySourceName,
+          sourceType: "api",
+          sourceUri,
+          label,
+          category: "contract",
+          entityType: "contract",
+          aggregatorLabel: cleanText(payload.compilation?.fullyQualifiedName) || cleanText(payload.compilation?.name),
+          aggregatorSource: "sourcify",
+          upstreamAggregatorLabel: null,
+          upstreamAggregatorSource: null,
+          confidence,
+          metadata,
+          sourceRecordedAt: new Date(),
+          externalAddedAt: cleanText(payload.verifiedAt) ? new Date(String(payload.verifiedAt)) : null,
+        }),
+        check: null,
+        status: "found",
+      };
+    } catch (error) {
+      if (attempt === maxAttempts) {
+        logLine("failed Sourcify lookup", {
+          network,
+          address,
+          attempt,
+          error: error instanceof Error ? cleanText(error.message) || "error" : "error",
+        });
+        return {
+          row: null,
+          check: null,
+          status: "error",
+        };
+      }
+
+      await sleep(500 * attempt);
+    }
+  }
+
+  return {
+    row: null,
+    check: null,
+    status: "error",
+  };
+};
+
+const loadSourcifyRows = async ({
+  client,
+}: {
+  client: ReturnType<typeof createServingClient>;
+}) => {
+  const { limit, recheckDays, concurrency } = sourcifySettings();
+
+  if (limit <= 0) {
+    logLine("skipped Sourcify label sync", { reason: "zero_lookup_limit" });
+    return {
+      rows: [] as RawAddressLabelRow[],
+      checks: [] as AddressLabelSourceCheckRow[],
+    };
+  }
+
+  const candidates = await listSourcifyCandidates({ client, limit, recheckDays });
+
+  if (candidates.length === 0) {
+    logLine("skipped Sourcify label sync", { reason: "no_candidates" });
+    return {
+      rows: [] as RawAddressLabelRow[],
+      checks: [] as AddressLabelSourceCheckRow[],
+    };
+  }
+
+  const startedAt = performance.now();
+  const results: SourcifyLookupResult[] = [];
+
+  for (const chunk of chunkRows(candidates, concurrency)) {
+    const batch = await Promise.all(chunk.map(fetchSourcifyContract));
+    results.push(...batch);
+  }
+
+  const rows = results.flatMap((result) => (result.row ? [result.row] : []));
+  const checks = results.flatMap((result) => (result.check ? [result.check] : []));
+  const foundCount = results.filter((result) => result.status === "found").length;
+  const notFoundCount = results.filter((result) => result.status === "not_found").length;
+  const missingLabelCount = results.filter((result) => result.status === "missing_label").length;
+  const errorCount = results.filter((result) => result.status === "error").length;
+
+  logLine("loaded Sourcify contract labels", {
+    candidates: candidates.length,
+    found: foundCount,
+    not_found: notFoundCount,
+    missing_label: missingLabelCount,
+    errors: errorCount,
+    duration_ms: Math.round(performance.now() - startedAt),
+  });
+
+  return { rows, checks };
+};
+
 const deleteMissingSnapshotRows = async ({
   client,
   sourceName,
@@ -1307,10 +1695,29 @@ const upsertRawRows = async (client: ReturnType<typeof createServingClient>, row
   }
 };
 
+const upsertSourceChecks = async (
+  client: ReturnType<typeof createServingClient>,
+  rows: AddressLabelSourceCheckRow[],
+) => {
+  const columns = ["source_name", "network", "address", "status", "source_uri", "metadata", "checked_at", "updated_at"];
+
+  for (const chunk of chunkRows(rows, 1000)) {
+    const { text, params } = buildUpsertSql({
+      table: "address_label_source_checks",
+      columns,
+      rows: chunk as unknown as Record<string, unknown>[],
+      conflict: ["source_name", "network", "address"],
+      updates: columns.filter((column) => column !== "source_name" && column !== "network" && column !== "address"),
+    });
+    await client.query(text, params);
+  }
+};
+
 export const syncLabels = async () => {
   await ensureServingSchema();
   const skipLocal = parseBool(parseArgValue("skip-local"));
   const skipDuneUpload = parseBool(parseArgValue("skip-dune-upload"));
+  const skipSourcify = parseBool(parseArgValue("skip-sourcify"));
   const duneUploadNamespace = resolveDuneUploadNamespace();
   const duneConfigPath = await resolvedDuneConfigPath();
   const startedAt = performance.now();
@@ -1381,6 +1788,28 @@ export const syncLabels = async () => {
       await client.query("truncate table address_labels");
       await client.query(resolveLabelsSql);
       await client.query("commit");
+    }
+
+    const sourcifyResult = skipSourcify ? { rows: [], checks: [] } : await loadSourcifyRows({ client });
+
+    if (sourcifyResult.rows.length > 0 || sourcifyResult.checks.length > 0) {
+      await client.query("begin");
+
+      if (sourcifyResult.checks.length > 0) {
+        await upsertSourceChecks(client, sourcifyResult.checks);
+      }
+
+      if (sourcifyResult.rows.length > 0) {
+        await upsertRawRows(client, sourcifyResult.rows);
+        await client.query("truncate table address_labels");
+        await client.query(resolveLabelsSql);
+      }
+
+      await client.query("commit");
+      logLine("synced Sourcify contract labels", {
+        rows: sourcifyResult.rows.length,
+        checks: sourcifyResult.checks.length,
+      });
     }
 
     const result = await client.query<{ count: string }>("select count(*)::text as count from address_labels");
