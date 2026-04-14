@@ -1,0 +1,17 @@
+[
+  {
+    "sourceName": "dune_cex_labels",
+    "sourceType": "dune",
+    "sourceUri": "https://dune.com/queries/your-query-id",
+    "mode": "incremental",
+    "defaultNetwork": "*",
+    "defaultConfidence": 0.9,
+    "networkColumn": "network",
+    "addressColumn": "address",
+    "labelColumn": "label",
+    "categoryColumn": "category",
+    "entityTypeColumn": "entity_type",
+    "externalAddedAtColumn": "date_added",
+    "sql": "select network, lower(address) as address, label, category, entity_type, date_added from your_dataset where ({{external_added_after}} is null or date_added > cast({{external_added_after}} as timestamp))"
+  }
+]

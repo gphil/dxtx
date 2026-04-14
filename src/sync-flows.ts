@@ -8,6 +8,7 @@ import { resolveRpcUrl, resolveSqdUrl, supportedChains } from "./chains.js";
 import { findBlockByTimestamp } from "./evm.js";
 import { escapeSqlString } from "./format.js";
 import { logLine } from "./log.js";
+import { ensureServingSchema } from "./serving-schema.js";
 import type { Chain } from "./types.js";
 
 const flowWindows = [1, 7, 30, 90] as const;
@@ -24,21 +25,6 @@ const networkByChain: Record<Chain, Network> = {
   unichain: "unichain",
 };
 const networkName = (chain: Chain): Network => networkByChain[chain];
-const networkMappings = Object.entries(networkByChain) as Array<[Chain, Network]>;
-const legacyNetworkValuesSql = networkMappings
-  .map(([chain]) => `'${escapeSqlString(chain)}'`)
-  .join(", ");
-const normalizedNetworkSql = (column: string) => `
-  case ${column}
-    ${networkMappings
-      .map(
-        ([chain, network]) =>
-          `when '${escapeSqlString(chain)}' then '${escapeSqlString(network)}'`,
-      )
-      .join("\n    ")}
-    else ${column}
-  end
-`;
 const normalizeEnvName = (chain: Chain) => chain.toUpperCase();
 const chainEnvValue = (baseKey: string, chain: Chain) =>
   process.env[`${baseKey}_${normalizeEnvName(chain)}`] ?? process.env[baseKey];
@@ -166,8 +152,11 @@ const configureS3 = async (connection: DuckDBConnection, env: NodeJS.ProcessEnv)
   const endpointValue = assertEnv(env.CACHE_S3_ENDPOINT, "CACHE_S3_ENDPOINT");
   const endpoint = endpointValue.replace(/^[a-z]+:\/\//i, "").replace(/\/+$/, "");
   const region = assertEnv(env.CACHE_S3_REGION, "CACHE_S3_REGION");
-  const accessKeyId = assertEnv(env.CACHE_S3_ACCESS_KEY_ID, "CACHE_S3_ACCESS_KEY_ID");
-  const secretAccessKey = assertEnv(env.CACHE_S3_SECRET_ACCESS_KEY, "CACHE_S3_SECRET_ACCESS_KEY");
+  const accessKeyId = assertEnv(env.CACHE_S3_ACCESS_KEY_ID ?? env.AWS_ACCESS_KEY_ID, "CACHE_S3_ACCESS_KEY_ID");
+  const secretAccessKey = assertEnv(
+    env.CACHE_S3_SECRET_ACCESS_KEY ?? env.AWS_SECRET_ACCESS_KEY,
+    "CACHE_S3_SECRET_ACCESS_KEY",
+  );
   const sessionToken = env.CACHE_S3_SESSION_TOKEN;
   const useSsl = endpointValue.startsWith("http://") ? "false" : "true";
 
@@ -915,6 +904,29 @@ type DailyTotalExportRow = {
   as_of_ts: string;
 };
 
+type DailyAddressFlowExportRow = {
+  network: string;
+  token_address: string;
+  day: string;
+  token_name: string | null;
+  token_symbol: string | null;
+  token_decimals: number | null;
+  target_source: string | null;
+  coingecko_id: string | null;
+  coingecko_name: string | null;
+  coingecko_symbol: string | null;
+  address: string;
+  sent_transfer_count: bigint | number;
+  received_transfer_count: bigint | number;
+  total_transfer_count: bigint | number;
+  sent_amount_native_sum: number;
+  received_amount_native_sum: number;
+  gross_amount_native_sum: number;
+  net_amount_native_sum: number;
+  is_partial_day: boolean;
+  as_of_ts: string;
+};
+
 type LeaderboardExportRow = {
   network: string;
   token_address: string;
@@ -981,6 +993,42 @@ const dailyTotalsExportSql = ({
   where ${fullRebuild ? "true" : "exists (select 1 from source_days_tokens as affected where affected.chain = totals.chain and affected.day = totals.day and affected.token_address = totals.token_address)"}
 `;
 
+const dailyAddressFlowsExportSql = ({
+  asOfTs,
+  latestDay,
+  fullRebuild,
+  network,
+}: {
+  asOfTs: string;
+  latestDay: string;
+  fullRebuild: boolean;
+  network: Network;
+}) => `
+  select
+    '${escapeSqlString(network)}' as network,
+    flows.token_address,
+    cast(flows.day as varchar) as day,
+    flows.token_name,
+    flows.token_symbol,
+    flows.token_decimals,
+    flows.target_source,
+    flows.coingecko_id,
+    flows.coingecko_name,
+    flows.coingecko_symbol,
+    flows.address,
+    flows.sent_transfer_count,
+    flows.received_transfer_count,
+    flows.total_transfer_count,
+    flows.sent_amount_native_sum,
+    flows.received_amount_native_sum,
+    flows.gross_amount_native_sum,
+    flows.net_amount_native_sum,
+    flows.day = date '${escapeSqlString(latestDay)}' as is_partial_day,
+    '${escapeSqlString(asOfTs)}' as as_of_ts
+  from token_daily_address_flows as flows
+  where ${fullRebuild ? "true" : "exists (select 1 from source_days_tokens as affected where affected.chain = flows.chain and affected.day = flows.day and affected.token_address = flows.token_address)"}
+`;
+
 const leaderboardExportSql = ({
   asOfTs,
   fullRebuild,
@@ -1029,69 +1077,6 @@ const chunkRows = <T>(values: T[], size: number) =>
   Array.from({ length: Math.ceil(values.length / size) }, (_, index) =>
     values.slice(index * size, (index + 1) * size),
   );
-
-const createServingSchemaSql = `
-  do $$
-  begin
-    begin
-      alter table token_flow_daily_totals rename column chain to network;
-    exception
-      when undefined_column or duplicate_column or undefined_table then null;
-    end;
-
-    begin
-      alter table token_flow_leaderboards rename column chain to network;
-    exception
-      when undefined_column or duplicate_column or undefined_table then null;
-    end;
-  end
-  $$;
-
-  create table if not exists token_flow_daily_totals (
-    network text not null,
-    token_address text not null,
-    day date not null,
-    transfer_count bigint not null,
-    amount_native_sum double precision not null,
-    avg_amount_native double precision,
-    is_partial_day boolean not null,
-    as_of_ts timestamptz not null,
-    primary key (network, token_address, day)
-  );
-
-  create table if not exists token_flow_leaderboards (
-    network text not null,
-    token_address text not null,
-    token_name text,
-    token_symbol text,
-    token_decimals integer,
-    target_source text,
-    coingecko_id text,
-    coingecko_name text,
-    coingecko_symbol text,
-    window_days integer not null,
-    window_start_day date not null,
-    window_end_day date not null,
-    is_partial_day boolean not null,
-    metric text not null,
-    address text not null,
-    flow_rank bigint not null,
-    transfer_count bigint not null,
-    amount_native_sum double precision not null,
-    avg_amount_native double precision,
-    as_of_ts timestamptz not null,
-    primary key (network, token_address, window_days, metric, flow_rank)
-  );
-
-  update token_flow_daily_totals
-  set network = ${normalizedNetworkSql("network")}
-  where network in (${legacyNetworkValuesSql});
-
-  update token_flow_leaderboards
-  set network = ${normalizedNetworkSql("network")}
-  where network in (${legacyNetworkValuesSql});
-`;
-const servingSchemaLockKey = 20_260_410;
 
 const insertRowsSql = ({
   table,
@@ -1184,6 +1169,10 @@ const exportToPostgres = async ({
     connection,
     dailyTotalsExportSql({ asOfTs, latestDay, fullRebuild, network }),
   );
+  const dailyAddressFlows = await rows<DailyAddressFlowExportRow>(
+    connection,
+    dailyAddressFlowsExportSql({ asOfTs, latestDay, fullRebuild, network }),
+  );
   const leaderboards = includeLeaderboards
     ? await rows<LeaderboardExportRow>(
         connection,
@@ -1200,6 +1189,10 @@ const exportToPostgres = async ({
 
   try {
     await client.query("begin");
+
+    if (fullRebuild) {
+      await client.query("delete from token_daily_address_flows where network = $1", [network]);
+    }
 
     if (dailyTotals.length > 0) {
       const columns = [
@@ -1219,6 +1212,42 @@ const exportToPostgres = async ({
           columns,
           rows: chunk as unknown as Record<string, unknown>[],
           conflict: ["network", "token_address", "day"],
+          updates: columns.slice(3),
+        });
+        await client.query(text, params);
+      }
+    }
+
+    if (dailyAddressFlows.length > 0) {
+      const columns = [
+        "network",
+        "token_address",
+        "day",
+        "token_name",
+        "token_symbol",
+        "token_decimals",
+        "target_source",
+        "coingecko_id",
+        "coingecko_name",
+        "coingecko_symbol",
+        "address",
+        "sent_transfer_count",
+        "received_transfer_count",
+        "total_transfer_count",
+        "sent_amount_native_sum",
+        "received_amount_native_sum",
+        "gross_amount_native_sum",
+        "net_amount_native_sum",
+        "is_partial_day",
+        "as_of_ts",
+      ];
+
+      for (const chunk of chunkRows(dailyAddressFlows, 1000)) {
+        const { text, params } = insertRowsSql({
+          table: "token_daily_address_flows",
+          columns,
+          rows: chunk as unknown as Record<string, unknown>[],
+          conflict: ["network", "token_address", "day", "address"],
           updates: columns.slice(3),
         });
         await client.query(text, params);
@@ -1274,6 +1303,7 @@ const exportToPostgres = async ({
     logLine("published flows to postgres", {
       chain,
       daily_rows: dailyTotals.length,
+      daily_address_flow_rows: dailyAddressFlows.length,
       leaderboard_rows: includeLeaderboards ? leaderboards.length : undefined,
       deferred_leaderboards: includeLeaderboards ? undefined : 1,
       full_rebuild: fullRebuild ? 1 : undefined,
@@ -1287,25 +1317,11 @@ const exportToPostgres = async ({
 };
 
 const ensurePostgresSchema = async () => {
-  const databaseUrl = postgresConnectionString();
-
-  if (!databaseUrl) {
+  if (!postgresConnectionString()) {
     return;
   }
 
-  const client = new Client({ connectionString: databaseUrl });
-
-  await client.connect();
-
-  try {
-    await client.query("select pg_advisory_lock($1)", [servingSchemaLockKey]);
-    await client.query(createServingSchemaSql);
-  } finally {
-    await client
-      .query("select pg_advisory_unlock($1)", [servingSchemaLockKey])
-      .catch(() => undefined);
-    await client.end();
-  }
+  await ensureServingSchema();
 };
 
 const selectPostgresLatestTotalsDay = async (network: Network) => {

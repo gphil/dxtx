@@ -6,6 +6,7 @@ type DuneExecuteResponse = {
 type DuneStatusResponse = {
   state: string;
   is_execution_finished: boolean;
+  error?: unknown;
 };
 
 type DuneResultsResponse<T> = {
@@ -114,7 +115,7 @@ export const executeDuneSql = async <T>({
     }
 
     if (status.is_execution_finished && isFailedState(status.state)) {
-      throw new Error(`Dune execution failed: ${status.state}`);
+      throw new Error(`Dune execution failed: ${status.state} ${JSON.stringify(status)}`);
     }
 
     await sleep(pollMs);
