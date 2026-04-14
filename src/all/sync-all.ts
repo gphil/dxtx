@@ -24,6 +24,32 @@ const labelIntervalMinutes = () => {
 
 const forwardFlowArgs = (args: string[]) => args.filter((arg) => !arg.startsWith("--"));
 
+const createShutdownController = () => {
+  let shuttingDown = false;
+  let resolveShutdown: () => void = () => {};
+  const shutdownPromise = new Promise<void>((resolve) => {
+    resolveShutdown = resolve;
+  });
+
+  const requestShutdown = (signal: NodeJS.Signals) => {
+    if (shuttingDown) {
+      return;
+    }
+
+    shuttingDown = true;
+    logLine("received shutdown signal", { signal });
+    resolveShutdown();
+  };
+
+  process.once("SIGINT", () => requestShutdown("SIGINT"));
+  process.once("SIGTERM", () => requestShutdown("SIGTERM"));
+
+  return {
+    isShuttingDown: () => shuttingDown,
+    waitForShutdown: () => shutdownPromise,
+  };
+};
+
 const createLabelSyncRunner = () => {
   const configuredInterval = Number.parseInt(parseArgValue("label-interval-minutes") || "", 10);
   const intervalMinutes =
@@ -60,7 +86,6 @@ const createLabelSyncRunner = () => {
 
 const runMetadataCycle = async (runLabelSyncIfDue: () => Promise<void>) => {
   const startedAt = performance.now();
-  await ensureServingSchema();
   await runLabelSyncIfDue();
   await refreshPrices();
   await refreshEnrichedLeaderboards();
@@ -69,16 +94,33 @@ const runMetadataCycle = async (runLabelSyncIfDue: () => Promise<void>) => {
   });
 };
 
-const runFlowSyncOnce = async (args: string[]) =>
+const runFlowSyncOnce = async ({
+  args,
+  isShuttingDown,
+  waitForShutdown,
+}: {
+  args: string[];
+  isShuttingDown: () => boolean;
+  waitForShutdown: () => Promise<void>;
+}) =>
   new Promise<void>((resolve, reject) => {
     const child = spawn(process.execPath, ["--require=dotenv/config", flowWorkerPath, ...args], {
       cwd: process.cwd(),
-      env: process.env,
+      env: { ...process.env, SKIP_POSTGRES_SCHEMA: "1" },
       stdio: "inherit",
+    });
+
+    void waitForShutdown().then(() => {
+      child.kill("SIGTERM");
     });
 
     child.on("error", reject);
     child.on("close", (code, signal) => {
+      if (isShuttingDown() && (signal === "SIGINT" || signal === "SIGTERM")) {
+        resolve();
+        return;
+      }
+
       if (code === 0) {
         resolve();
         return;
@@ -88,23 +130,33 @@ const runFlowSyncOnce = async (args: string[]) =>
     });
   });
 
-const runFlowSyncLoop = (args: string[]) => {
+const runFlowSyncLoop = ({
+  args,
+  isShuttingDown,
+  waitForShutdown,
+}: {
+  args: string[];
+  isShuttingDown: () => boolean;
+  waitForShutdown: () => Promise<void>;
+}) => {
   const child = spawn(process.execPath, ["--require=dotenv/config", flowWorkerPath, ...args], {
     cwd: process.cwd(),
-    env: { ...process.env, FLOW_SYNC_LOOP: "1" },
+    env: { ...process.env, FLOW_SYNC_LOOP: "1", SKIP_POSTGRES_SCHEMA: "1" },
     stdio: "inherit",
   });
 
-  const stop = () => {
+  void waitForShutdown().then(() => {
     child.kill("SIGTERM");
-  };
+  });
 
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
-
-  return new Promise<never>((_, reject) => {
+  return new Promise<void>((resolve, reject) => {
     child.on("error", reject);
     child.on("close", (code, signal) => {
+      if (isShuttingDown() && (signal === "SIGINT" || signal === "SIGTERM")) {
+        resolve();
+        return;
+      }
+
       reject(new Error(`sync:flows loop exited code=${code ?? "null"} signal=${signal ?? "null"}`));
     });
   });
@@ -119,17 +171,30 @@ const main = async () => {
       : metadataIntervalMinutes();
   const flowArgs = forwardFlowArgs(process.argv.slice(2));
   const runLabelSyncIfDue = createLabelSyncRunner();
+  const shutdown = createShutdownController();
+
+  logLine("ensuring serving schema", {});
+  await ensureServingSchema();
+  logLine("serving schema ready", {});
 
   if (once) {
-    await runFlowSyncOnce(flowArgs);
-    await runMetadataCycle(runLabelSyncIfDue);
+    await runFlowSyncOnce({
+      args: flowArgs,
+      isShuttingDown: shutdown.isShuttingDown,
+      waitForShutdown: shutdown.waitForShutdown,
+    });
+
+    if (!shutdown.isShuttingDown()) {
+      await runMetadataCycle(runLabelSyncIfDue);
+    }
+
     return;
   }
 
   const metadataLoop = async () => {
-    while (true) {
+    while (!shutdown.isShuttingDown()) {
       await runMetadataCycle(runLabelSyncIfDue);
-      await sleep(metadataMinutes * 60 * 1000);
+      await Promise.race([sleep(metadataMinutes * 60 * 1000), shutdown.waitForShutdown()]);
     }
   };
 
@@ -139,7 +204,14 @@ const main = async () => {
     labels_enabled: !parseBool(parseArgValue("skip-labels")) ? "true" : "false",
   });
 
-  await Promise.all([runFlowSyncLoop(flowArgs), metadataLoop()]);
+  await Promise.all([
+    runFlowSyncLoop({
+      args: flowArgs,
+      isShuttingDown: shutdown.isShuttingDown,
+      waitForShutdown: shutdown.waitForShutdown,
+    }),
+    metadataLoop(),
+  ]);
 };
 
 main().catch((error) => {

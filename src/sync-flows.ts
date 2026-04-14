@@ -1321,6 +1321,10 @@ const ensurePostgresSchema = async () => {
     return;
   }
 
+  if (envFlag("SKIP_POSTGRES_SCHEMA")) {
+    return;
+  }
+
   await ensureServingSchema();
 };
 
