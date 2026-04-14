@@ -1,0 +1,18 @@
+[
+  {
+    "sourceName": "dune_cex_labels",
+    "sourceType": "dune",
+    "sourceUri": "https://docs.dune.com/data-catalog/curated/cex-flows/addresses",
+    "mode": "incremental",
+    "defaultConfidence": 0.98,
+    "networkColumn": "network",
+    "addressColumn": "address",
+    "labelColumn": "label",
+    "categoryColumn": "category",
+    "entityTypeColumn": "entity_type",
+    "aggregatorLabelColumn": "aggregator_label",
+    "aggregatorSourceColumn": "aggregator_source",
+    "externalAddedAtColumn": "external_added_at",
+    "sql": "select blockchain as network, concat('0x', lower(to_hex(address))) as address, coalesce(distinct_name, cex_name) as label, 'cex' as category, 'exchange' as entity_type, cex_name as aggregator_label, 'cex.addresses' as aggregator_source, cast(added_date as timestamp) as external_added_at from cex.addresses where blockchain in ('ethereum', 'base', 'arbitrum', 'optimism', 'polygon', 'avalanche_c', 'bnb', 'unichain', 'zora', 'ink', 'blast') and ({{external_added_after}} is null or cast(added_date as timestamp) > cast({{external_added_after}} as timestamp))"
+  }
+]

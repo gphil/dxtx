@@ -1,0 +1,5 @@
+network,address,label,category,entity_type,source_uri,confidence,external_added_at,aggregator_label,aggregator_source,source_key,notes
+eth,0xaa8ba7d4611437141192e7ceced531bc0a133efb,Kraken: Hot Wallet 5,cex,exchange,https://etherscan.io/address/0xaa8ba7d4611437141192e7ceced531bc0a133efb,0.95,,,,kraken_hot_wallet_5,"Public Etherscan name tag"
+eth,0x611f7bf868a6212f871e89f7e44684045ddfb09d,OKX: Cold Wallet,cex,exchange,https://etherscan.io/address/0x611f7bf868a6212f871e89f7e44684045ddfb09d,0.95,,,,okx_cold_wallet,"Public Etherscan name tag"
+eth,0xccdcfc4598f539408fc0393b42905c1e0d24a91e,OKX: Cold Wallet 2,cex,exchange,https://etherscan.io/address/0xccdcfc4598f539408fc0393b42905c1e0d24a91e,0.95,,,,okx_cold_wallet_2,"Public Etherscan name tag"
+eth,0xbee3211ab312a8d065c4fef0247448e17a8da000,Market Maker: 0xbee...000,market_maker,market_maker,https://etherscan.io/address/0xbee3211ab312a8d065c4fef0247448e17a8da000,0.70,,,,market_maker_0xbee000,"Public Etherscan name tag"
