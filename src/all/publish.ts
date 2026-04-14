@@ -1,5 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -29,6 +28,8 @@ const publishPollIntervalMs = () => {
   const value = Number.parseInt(process.env.CACHE_POLL_INTERVAL_SEC || "60", 10);
   return Math.max(1, Number.isFinite(value) ? value : 60) * 1_000;
 };
+const sharedMetadataPath = () =>
+  join(process.cwd(), "analytics", "runtime", `shared-tokens-${process.pid}.json`);
 
 type ChildExit = {
   code: number | null;
@@ -42,8 +43,7 @@ const writeSharedMetadata = async (chains: Chain[]) => {
     chain,
     addresses: (targetsByChain.get(chain) ?? []).map((target) => target.address),
   }));
-  const tempDir = await mkdtemp(join(tmpdir(), "dxtx-shared-metadata-"));
-  const metadataPath = join(tempDir, "tokens.json");
+  const metadataPath = sharedMetadataPath();
   const tokens = await loadDuneUniverseTokenMetadata({
     scopes,
   }).catch((error) => {
@@ -60,6 +60,7 @@ const writeSharedMetadata = async (chains: Chain[]) => {
     resolved: tokens.length,
   });
 
+  await mkdir(dirname(metadataPath), { recursive: true });
   await writeFile(metadataPath, JSON.stringify(tokens), "utf8");
   return metadataPath;
 };
@@ -260,7 +261,6 @@ const main = async () => {
     await Promise.all(chains.map((chain) => runChainOrFail(chain, sharedMetadataPath)));
   } finally {
     await rm(sharedMetadataPath, { force: true }).catch(() => undefined);
-    await rm(dirname(sharedMetadataPath), { recursive: true, force: true }).catch(() => undefined);
   }
 };
 
