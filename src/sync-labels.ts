@@ -102,8 +102,18 @@ const supportedSupersetChains = new Set([
 ]);
 
 const zeroAddress = "0x0000000000000000000000000000000000000000";
+const blockscoutSourceName = "blockscout_address_info";
 const sourcifySourceName = "sourcify_verified_contracts";
 const sourcifyBaseUrl = "https://sourcify.dev/server/v2/contract";
+const blockscoutBaseUrlByNetwork: Record<string, string> = {
+  eth: "https://eth.blockscout.com",
+  base: "https://base.blockscout.com",
+  polygon: "https://polygon.blockscout.com",
+  arbitrum: "https://arbitrum.blockscout.com",
+  optimism: "https://optimism.blockscout.com",
+  zora: "https://zora.blockscout.com",
+  unichain: "https://unichain.blockscout.com",
+};
 
 const sourcifyChainIdByNetwork: Record<string, string> = {
   eth: "1",
@@ -119,6 +129,9 @@ const sourcifyChainIdByNetwork: Record<string, string> = {
   ink: "57073",
 };
 
+const blockscoutSupportedNetworks = new Set(Object.keys(blockscoutBaseUrlByNetwork));
+const sourcifySupportedNetworks = new Set(Object.keys(sourcifyChainIdByNetwork));
+
 const priorityCaseSql = `
   case
     when source_name = 'eigen_manual_labels' then 10
@@ -133,6 +146,7 @@ const priorityCaseSql = `
     when source_name like 'dune_%' then 50
     when source_name = 'eigen_cex_labels' then 50
     when source_name = 'eigen_etherscan_labels' then 60
+    when source_name = 'blockscout_address_info' then 62
     when source_name = 'eth_labels' then 65
     when source_name = 'sourcify_verified_contracts' then 68
     when source_name = 'eigen_names' then 70
@@ -395,10 +409,43 @@ type SourcifyContractResponse = {
   } | null;
 };
 
-type SourcifyLookupResult = {
+type AddressLookupStatus = "found" | "not_found" | "missing_label" | "error";
+
+type AddressLookupResult = {
   row: RawAddressLabelRow | null;
   check: AddressLabelSourceCheckRow | null;
-  status: "found" | "not_found" | "missing_label" | "error";
+  status: AddressLookupStatus;
+};
+
+type BlockscoutAddressResponse = {
+  name?: string | null;
+  is_contract?: boolean | null;
+  is_verified?: boolean | null;
+  implementation_name?: string | null;
+  public_tags?: Array<{
+    display_name?: string | null;
+    label?: string | null;
+  }> | null;
+  token?: {
+    name?: string | null;
+    symbol?: string | null;
+    type?: string | null;
+  } | null;
+};
+
+type BlockscoutPublicTag = {
+  displayName: string | null;
+  label: string | null;
+};
+
+type BlockscoutLabelSelection = {
+  label: string;
+  labelKind: "public_tag" | "contract_name" | "token_name";
+  category: string | null;
+  entityType: string | null;
+  confidence: number;
+  aggregatorLabel: string | null;
+  publicTag: BlockscoutPublicTag | null;
 };
 
 const ethLabelsChainMap: Record<string, string> = {
@@ -1338,6 +1385,33 @@ const parseIntegerSetting = ({
   return Number.isFinite(parsedEnvValue) ? parsedEnvValue : fallback;
 };
 
+const blockscoutSettings = () => ({
+  limit: Math.max(
+    0,
+    parseIntegerSetting({
+      argName: "blockscout-limit",
+      envName: "BLOCKSCOUT_LOOKUP_LIMIT",
+      fallback: 500,
+    }),
+  ),
+  recheckDays: Math.max(
+    0,
+    parseIntegerSetting({
+      argName: "blockscout-recheck-days",
+      envName: "BLOCKSCOUT_RECHECK_DAYS",
+      fallback: 30,
+    }),
+  ),
+  concurrency: Math.max(
+    1,
+    parseIntegerSetting({
+      argName: "blockscout-concurrency",
+      envName: "BLOCKSCOUT_CONCURRENCY",
+      fallback: 4,
+    }),
+  ),
+});
+
 const sourcifySettings = () => ({
   limit: Math.max(
     0,
@@ -1396,14 +1470,18 @@ const sourcifyMetadata = ({
 const sourcifySourceUri = (chainId: string, address: string) =>
   `${sourcifyBaseUrl}/${chainId}/${address}?fields=compilation,verifiedAt,creationMatch,runtimeMatch`;
 
-const listSourcifyCandidates = async ({
+const listUncheckedCandidates = async ({
   client,
+  sourceName,
   limit,
   recheckDays,
+  supportedNetworks,
 }: {
   client: ReturnType<typeof createServingClient>;
+  sourceName: string;
   limit: number;
   recheckDays: number;
+  supportedNetworks: Set<string>;
 }) => {
   if (limit <= 0) {
     return [] as Array<{ network: string; address: string }>;
@@ -1441,20 +1519,110 @@ const listSourcifyCandidates = async ({
       order by estimated_usd desc nulls last, best_flow_rank asc, row_count desc, network asc, address asc
       limit $4
     `,
-    [sourcifySourceName, zeroAddress, `${recheckDays} days`, limit],
+    [sourceName, zeroAddress, `${recheckDays} days`, limit],
   );
 
-  return result.rows.flatMap((row) =>
-    sourcifyChainIdByNetwork[row.network]
-      ? [
-          {
-            network: row.network,
-            address: row.address,
-          },
-        ]
-      : [],
-  );
+  return result.rows.filter((row) => supportedNetworks.has(row.network));
 };
+
+const listSourcifyCandidates = ({
+  client,
+  limit,
+  recheckDays,
+}: {
+  client: ReturnType<typeof createServingClient>;
+  limit: number;
+  recheckDays: number;
+}) =>
+  listUncheckedCandidates({
+    client,
+    sourceName: sourcifySourceName,
+    limit,
+    recheckDays,
+    supportedNetworks: sourcifySupportedNetworks,
+  });
+
+const listBlockscoutCandidates = ({
+  client,
+  limit,
+  recheckDays,
+}: {
+  client: ReturnType<typeof createServingClient>;
+  limit: number;
+  recheckDays: number;
+}) =>
+  listUncheckedCandidates({
+    client,
+    sourceName: blockscoutSourceName,
+    limit,
+    recheckDays,
+    supportedNetworks: blockscoutSupportedNetworks,
+  });
+
+const blockscoutSourceUri = (baseUrl: string, address: string) => `${baseUrl}/api/v2/addresses/${address}`;
+
+const blockscoutPublicTag = (payload: BlockscoutAddressResponse) =>
+  (payload.public_tags || [])
+    .map((tag) => ({
+      displayName: cleanText(tag.display_name),
+      label: cleanText(tag.label),
+    }))
+    .find((tag) => tag.displayName || tag.label) || null;
+
+const selectBlockscoutLabel = (payload: BlockscoutAddressResponse): BlockscoutLabelSelection | null => {
+  const publicTag = blockscoutPublicTag(payload);
+  const contractName = cleanText(payload.name);
+  const tokenName = cleanText(payload.token?.name);
+  const tokenSymbol = cleanText(payload.token?.symbol);
+  const tokenType = cleanText(payload.token?.type);
+  const implementationName = cleanText(payload.implementation_name);
+  const isContract = payload.is_contract === true;
+  const label = publicTag?.displayName || publicTag?.label || contractName || tokenName;
+
+  if (!label) {
+    return null;
+  }
+
+  const category =
+    (tokenType?.startsWith("ERC") ? "token" : null) ||
+    ethLabelsCategory(publicTag?.label || label, publicTag?.displayName || contractName) ||
+    (isContract ? "contract" : null);
+
+  return {
+    label,
+    labelKind: publicTag ? "public_tag" : contractName ? "contract_name" : "token_name",
+    category,
+    entityType: ethLabelsEntityType(category) || (isContract ? "contract" : null),
+    confidence: publicTag ? 0.8 : tokenType?.startsWith("ERC") ? 0.76 : payload.is_verified === true ? 0.74 : 0.7,
+    aggregatorLabel: publicTag?.label || tokenSymbol || implementationName,
+    publicTag,
+  };
+};
+
+const blockscoutMetadata = ({
+  network,
+  baseUrl,
+  payload,
+  selection,
+}: {
+  network: string;
+  baseUrl: string;
+  payload: BlockscoutAddressResponse;
+  selection: BlockscoutLabelSelection | null;
+}) => ({
+  network,
+  base_url: baseUrl,
+  label_kind: selection?.labelKind || null,
+  public_tag_display_name: selection?.publicTag?.displayName || null,
+  public_tag_label: selection?.publicTag?.label || null,
+  contract_name: cleanText(payload.name),
+  token_name: cleanText(payload.token?.name),
+  token_symbol: cleanText(payload.token?.symbol),
+  token_type: cleanText(payload.token?.type),
+  implementation_name: cleanText(payload.implementation_name),
+  is_contract: payload.is_contract === true,
+  is_verified: payload.is_verified === true,
+});
 
 const fetchSourcifyContract = async ({
   network,
@@ -1462,7 +1630,7 @@ const fetchSourcifyContract = async ({
 }: {
   network: string;
   address: string;
-}): Promise<SourcifyLookupResult> => {
+}): Promise<AddressLookupResult> => {
   const chainId = sourcifyChainIdByNetwork[network];
 
   if (!chainId) {
@@ -1572,6 +1740,171 @@ const fetchSourcifyContract = async ({
   };
 };
 
+const fetchBlockscoutAddress = async ({
+  network,
+  address,
+}: {
+  network: string;
+  address: string;
+}): Promise<AddressLookupResult> => {
+  const baseUrl = blockscoutBaseUrlByNetwork[network];
+
+  if (!baseUrl) {
+    return {
+      row: null,
+      check: null,
+      status: "error",
+    };
+  }
+
+  const sourceUri = blockscoutSourceUri(baseUrl, address);
+  const maxAttempts = 3;
+
+  for (const attempt of Array.from({ length: maxAttempts }, (_, index) => index + 1)) {
+    try {
+      const response = await fetch(sourceUri, {
+        headers: { accept: "application/json" },
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (response.status === 404) {
+        return {
+          row: null,
+          check: buildSourceCheck({
+            sourceName: blockscoutSourceName,
+            network,
+            address,
+            status: "not_found",
+            sourceUri,
+            metadata: { network, base_url: baseUrl, http_status: 404 },
+          }),
+          status: "not_found",
+        };
+      }
+
+      if (!response.ok) {
+        throw new Error(`unexpected_status_${response.status}`);
+      }
+
+      const payload = (await response.json()) as BlockscoutAddressResponse;
+      const selection = selectBlockscoutLabel(payload);
+      const metadata = blockscoutMetadata({ network, baseUrl, payload, selection });
+
+      if (!selection) {
+        return {
+          row: null,
+          check: buildSourceCheck({
+            sourceName: blockscoutSourceName,
+            network,
+            address,
+            status: "missing_label",
+            sourceUri,
+            metadata,
+          }),
+          status: "missing_label",
+        };
+      }
+
+      return {
+        row: buildRawLabel({
+          network,
+          address,
+          sourceName: blockscoutSourceName,
+          sourceType: "api",
+          sourceUri,
+          label: selection.label,
+          category: selection.category,
+          entityType: selection.entityType,
+          aggregatorLabel: selection.aggregatorLabel,
+          aggregatorSource: "blockscout",
+          upstreamAggregatorLabel: null,
+          upstreamAggregatorSource: null,
+          confidence: selection.confidence,
+          metadata,
+          sourceRecordedAt: new Date(),
+          externalAddedAt: null,
+        }),
+        check: null,
+        status: "found",
+      };
+    } catch (error) {
+      if (attempt === maxAttempts) {
+        logLine("failed Blockscout lookup", {
+          network,
+          address,
+          attempt,
+          error: error instanceof Error ? cleanText(error.message) || "error" : "error",
+        });
+        return {
+          row: null,
+          check: null,
+          status: "error",
+        };
+      }
+
+      await sleep(500 * attempt);
+    }
+  }
+
+  return {
+    row: null,
+    check: null,
+    status: "error",
+  };
+};
+
+const loadBlockscoutRows = async ({
+  client,
+}: {
+  client: ReturnType<typeof createServingClient>;
+}) => {
+  const { limit, recheckDays, concurrency } = blockscoutSettings();
+
+  if (limit <= 0) {
+    logLine("skipped Blockscout label sync", { reason: "zero_lookup_limit" });
+    return {
+      rows: [] as RawAddressLabelRow[],
+      checks: [] as AddressLabelSourceCheckRow[],
+    };
+  }
+
+  const candidates = await listBlockscoutCandidates({ client, limit, recheckDays });
+
+  if (candidates.length === 0) {
+    logLine("skipped Blockscout label sync", { reason: "no_candidates" });
+    return {
+      rows: [] as RawAddressLabelRow[],
+      checks: [] as AddressLabelSourceCheckRow[],
+    };
+  }
+
+  const startedAt = performance.now();
+  const results: AddressLookupResult[] = [];
+
+  for (const chunk of chunkRows(candidates, concurrency)) {
+    const batch = await Promise.all(chunk.map(fetchBlockscoutAddress));
+    results.push(...batch);
+  }
+
+  const rows = results.flatMap((result) => (result.row ? [result.row] : []));
+  const checks = results.flatMap((result) => (result.check ? [result.check] : []));
+  const foundCount = results.filter((result) => result.status === "found").length;
+  const notFoundCount = results.filter((result) => result.status === "not_found").length;
+  const missingLabelCount = results.filter((result) => result.status === "missing_label").length;
+  const errorCount = results.filter((result) => result.status === "error").length;
+
+  logLine("loaded Blockscout address labels", {
+    candidates: candidates.length,
+    found: foundCount,
+    not_found: notFoundCount,
+    missing_label: missingLabelCount,
+    errors: errorCount,
+    duration_ms: Math.round(performance.now() - startedAt),
+  });
+
+  return { rows, checks };
+};
+
 const loadSourcifyRows = async ({
   client,
 }: {
@@ -1598,7 +1931,7 @@ const loadSourcifyRows = async ({
   }
 
   const startedAt = performance.now();
-  const results: SourcifyLookupResult[] = [];
+  const results: AddressLookupResult[] = [];
 
   for (const chunk of chunkRows(candidates, concurrency)) {
     const batch = await Promise.all(chunk.map(fetchSourcifyContract));
@@ -1717,6 +2050,7 @@ export const syncLabels = async () => {
   await ensureServingSchema();
   const skipLocal = parseBool(parseArgValue("skip-local"));
   const skipDuneUpload = parseBool(parseArgValue("skip-dune-upload"));
+  const skipBlockscout = parseBool(parseArgValue("skip-blockscout"));
   const skipSourcify = parseBool(parseArgValue("skip-sourcify"));
   const duneUploadNamespace = resolveDuneUploadNamespace();
   const duneConfigPath = await resolvedDuneConfigPath();
@@ -1788,6 +2122,28 @@ export const syncLabels = async () => {
       await client.query("truncate table address_labels");
       await client.query(resolveLabelsSql);
       await client.query("commit");
+    }
+
+    const blockscoutResult = skipBlockscout ? { rows: [], checks: [] } : await loadBlockscoutRows({ client });
+
+    if (blockscoutResult.rows.length > 0 || blockscoutResult.checks.length > 0) {
+      await client.query("begin");
+
+      if (blockscoutResult.checks.length > 0) {
+        await upsertSourceChecks(client, blockscoutResult.checks);
+      }
+
+      if (blockscoutResult.rows.length > 0) {
+        await upsertRawRows(client, blockscoutResult.rows);
+        await client.query("truncate table address_labels");
+        await client.query(resolveLabelsSql);
+      }
+
+      await client.query("commit");
+      logLine("synced Blockscout address labels", {
+        rows: blockscoutResult.rows.length,
+        checks: blockscoutResult.checks.length,
+      });
     }
 
     const sourcifyResult = skipSourcify ? { rows: [], checks: [] } : await loadSourcifyRows({ client });
