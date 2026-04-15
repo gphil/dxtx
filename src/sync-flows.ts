@@ -127,6 +127,24 @@ const run = async (connection: DuckDBConnection, sql: string) => {
 const rows = async <T>(connection: DuckDBConnection, sql: string) =>
   (await connection.runAndReadAll(sql)).getRowObjectsJS() as T[];
 
+const streamRows = async <T>(
+  connection: DuckDBConnection,
+  sql: string,
+  visitRows: (rows: T[]) => Promise<void>,
+) => {
+  const result = await connection.stream(sql);
+
+  for await (const chunk of result.yieldRowObjectJs()) {
+    const batch = chunk as T[];
+
+    if (batch.length === 0) {
+      continue;
+    }
+
+    await visitRows(batch);
+  }
+};
+
 const configureDuckDb = async ({
   connection,
   chain,
@@ -1110,6 +1128,33 @@ const insertRowsSql = ({
   };
 };
 
+const upsertRowBatch = async ({
+  client,
+  table,
+  columns,
+  rows,
+  conflict,
+  updates,
+}: {
+  client: Client;
+  table: string;
+  columns: string[];
+  rows: Record<string, unknown>[];
+  conflict: string[];
+  updates: string[];
+}) => {
+  for (const chunk of chunkRows(rows, 1000)) {
+    const { text, params } = insertRowsSql({
+      table,
+      columns,
+      rows: chunk,
+      conflict,
+      updates,
+    });
+    await client.query(text, params);
+  }
+};
+
 const deleteAffectedLeaderboardRows = async ({
   client,
   network,
@@ -1165,25 +1210,14 @@ const exportToPostgres = async ({
   }
 
   const asOfTs = new Date().toISOString();
-  const dailyTotals = await rows<DailyTotalExportRow>(
-    connection,
-    dailyTotalsExportSql({ asOfTs, latestDay, fullRebuild, network }),
-  );
-  const dailyAddressFlows = await rows<DailyAddressFlowExportRow>(
-    connection,
-    dailyAddressFlowsExportSql({ asOfTs, latestDay, fullRebuild, network }),
-  );
-  const leaderboards = includeLeaderboards
-    ? await rows<LeaderboardExportRow>(
-        connection,
-        leaderboardExportSql({ asOfTs, fullRebuild, network }),
-      )
-    : [];
   const affectedTokens =
     includeLeaderboards && !fullRebuild
       ? await rows<TokenExportRow>(connection, affectedTokensSql)
       : [];
   const client = new Client({ connectionString: databaseUrl });
+  let dailyTotalsCount = 0;
+  let dailyAddressFlowsCount = 0;
+  let leaderboardCount = 0;
 
   await client.connect();
 
@@ -1194,65 +1228,69 @@ const exportToPostgres = async ({
       await client.query("delete from token_daily_address_flows where network = $1", [network]);
     }
 
-    if (dailyTotals.length > 0) {
-      const columns = [
-        "network",
-        "token_address",
-        "day",
-        "transfer_count",
-        "amount_native_sum",
-        "avg_amount_native",
-        "is_partial_day",
-        "as_of_ts",
-      ];
-
-      for (const chunk of chunkRows(dailyTotals, 1000)) {
-        const { text, params } = insertRowsSql({
+    const dailyTotalsColumns = [
+      "network",
+      "token_address",
+      "day",
+      "transfer_count",
+      "amount_native_sum",
+      "avg_amount_native",
+      "is_partial_day",
+      "as_of_ts",
+    ];
+    await streamRows<DailyTotalExportRow>(
+      connection,
+      dailyTotalsExportSql({ asOfTs, latestDay, fullRebuild, network }),
+      async (batch) => {
+        dailyTotalsCount += batch.length;
+        await upsertRowBatch({
+          client,
           table: "token_flow_daily_totals",
-          columns,
-          rows: chunk as unknown as Record<string, unknown>[],
+          columns: dailyTotalsColumns,
+          rows: batch as unknown as Record<string, unknown>[],
           conflict: ["network", "token_address", "day"],
-          updates: columns.slice(3),
+          updates: dailyTotalsColumns.slice(3),
         });
-        await client.query(text, params);
-      }
-    }
+      },
+    );
 
-    if (dailyAddressFlows.length > 0) {
-      const columns = [
-        "network",
-        "token_address",
-        "day",
-        "token_name",
-        "token_symbol",
-        "token_decimals",
-        "target_source",
-        "coingecko_id",
-        "coingecko_name",
-        "coingecko_symbol",
-        "address",
-        "sent_transfer_count",
-        "received_transfer_count",
-        "total_transfer_count",
-        "sent_amount_native_sum",
-        "received_amount_native_sum",
-        "gross_amount_native_sum",
-        "net_amount_native_sum",
-        "is_partial_day",
-        "as_of_ts",
-      ];
-
-      for (const chunk of chunkRows(dailyAddressFlows, 1000)) {
-        const { text, params } = insertRowsSql({
+    const dailyAddressFlowColumns = [
+      "network",
+      "token_address",
+      "day",
+      "token_name",
+      "token_symbol",
+      "token_decimals",
+      "target_source",
+      "coingecko_id",
+      "coingecko_name",
+      "coingecko_symbol",
+      "address",
+      "sent_transfer_count",
+      "received_transfer_count",
+      "total_transfer_count",
+      "sent_amount_native_sum",
+      "received_amount_native_sum",
+      "gross_amount_native_sum",
+      "net_amount_native_sum",
+      "is_partial_day",
+      "as_of_ts",
+    ];
+    await streamRows<DailyAddressFlowExportRow>(
+      connection,
+      dailyAddressFlowsExportSql({ asOfTs, latestDay, fullRebuild, network }),
+      async (batch) => {
+        dailyAddressFlowsCount += batch.length;
+        await upsertRowBatch({
+          client,
           table: "token_daily_address_flows",
-          columns,
-          rows: chunk as unknown as Record<string, unknown>[],
+          columns: dailyAddressFlowColumns,
+          rows: batch as unknown as Record<string, unknown>[],
           conflict: ["network", "token_address", "day", "address"],
-          updates: columns.slice(3),
+          updates: dailyAddressFlowColumns.slice(3),
         });
-        await client.query(text, params);
-      }
-    }
+      },
+    );
 
     if (includeLeaderboards) {
       await deleteAffectedLeaderboardRows({
@@ -1263,8 +1301,8 @@ const exportToPostgres = async ({
       });
     }
 
-    if (includeLeaderboards && leaderboards.length > 0) {
-      const columns = [
+    if (includeLeaderboards) {
+      const leaderboardColumns = [
         "network",
         "token_address",
         "token_name",
@@ -1286,25 +1324,29 @@ const exportToPostgres = async ({
         "avg_amount_native",
         "as_of_ts",
       ];
-
-      for (const chunk of chunkRows(leaderboards, 1000)) {
-        const { text, params } = insertRowsSql({
-          table: "token_flow_leaderboards",
-          columns,
-          rows: chunk as unknown as Record<string, unknown>[],
-          conflict: ["network", "token_address", "window_days", "metric", "flow_rank"],
-          updates: columns.slice(2),
-        });
-        await client.query(text, params);
-      }
+      await streamRows<LeaderboardExportRow>(
+        connection,
+        leaderboardExportSql({ asOfTs, fullRebuild, network }),
+        async (batch) => {
+          leaderboardCount += batch.length;
+          await upsertRowBatch({
+            client,
+            table: "token_flow_leaderboards",
+            columns: leaderboardColumns,
+            rows: batch as unknown as Record<string, unknown>[],
+            conflict: ["network", "token_address", "window_days", "metric", "flow_rank"],
+            updates: leaderboardColumns.slice(2),
+          });
+        },
+      );
     }
 
     await client.query("commit");
     logLine("published flows to postgres", {
       chain,
-      daily_rows: dailyTotals.length,
-      daily_address_flow_rows: dailyAddressFlows.length,
-      leaderboard_rows: includeLeaderboards ? leaderboards.length : undefined,
+      daily_rows: dailyTotalsCount,
+      daily_address_flow_rows: dailyAddressFlowsCount,
+      leaderboard_rows: includeLeaderboards ? leaderboardCount : undefined,
       deferred_leaderboards: includeLeaderboards ? undefined : 1,
       full_rebuild: fullRebuild ? 1 : undefined,
     });
