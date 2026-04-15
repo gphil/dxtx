@@ -961,10 +961,13 @@ const resolvedDuneConfigPath = async () => {
 
 const loadDuneSources = async (configPath: string | null) => {
   if (!configPath) {
+    logLine("skipped Dune label sync", { reason: "missing_config" });
     return [] as RawAddressLabelRow[];
   }
 
+  const startedAt = performance.now();
   const configs = JSON.parse(await readFile(configPath, "utf8")) as DuneSourceConfig[];
+  logLine("loading Dune label sources", { config_path: configPath, source_count: configs.length });
   const client = createServingClient();
   await client.connect();
 
@@ -1028,7 +1031,14 @@ const loadDuneSources = async (configPath: string | null) => {
       }),
     );
 
-    return loadedGroups.flat();
+    const rows = loadedGroups.flat();
+    logLine("loaded Dune label sources", {
+      config_path: configPath,
+      source_count: configs.length,
+      rows: rows.length,
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    return rows;
   } finally {
     await client.end();
   }
@@ -2049,6 +2059,7 @@ const upsertSourceChecks = async (
 export const syncLabels = async () => {
   await ensureServingSchema();
   const skipLocal = parseBool(parseArgValue("skip-local"));
+  const skipDune = parseBool(parseArgValue("skip-dune"));
   const skipDuneUpload = parseBool(parseArgValue("skip-dune-upload"));
   const skipBlockscout = parseBool(parseArgValue("skip-blockscout"));
   const skipSourcify = parseBool(parseArgValue("skip-sourcify"));
@@ -2056,6 +2067,13 @@ export const syncLabels = async () => {
   const duneConfigPath = await resolvedDuneConfigPath();
   const startedAt = performance.now();
   const client = createServingClient();
+  logLine("starting address label sync", {
+    skip_local: Number(skipLocal),
+    skip_dune: Number(skipDune),
+    skip_dune_upload: Number(skipDuneUpload),
+    skip_blockscout: Number(skipBlockscout),
+    skip_sourcify: Number(skipSourcify),
+  });
   const sourceGroups = skipLocal
       ? []
       : [
@@ -2068,7 +2086,9 @@ export const syncLabels = async () => {
         { sourceName: "eigen_names", rows: await loadEigenNames() },
         { sourceName: "superset_cr_router_labels", rows: await loadSupersetRouterLabels() },
       ];
-  const duneRows = await loadDuneSources(duneConfigPath);
+  const duneRows = skipDune
+    ? (logLine("skipped Dune label sync", { reason: "skip_flag" }), [] as RawAddressLabelRow[])
+    : await loadDuneSources(duneConfigPath);
   const duneGroups = groupRowsBySourceName(duneRows);
 
   await client.connect();

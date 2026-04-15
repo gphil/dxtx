@@ -11,6 +11,7 @@ import {
   normalizeNetwork,
   nowDayText,
   parseArgValue,
+  parseBool,
   parseIntegerArg,
 } from "./serving.js";
 import { ensureServingSchema } from "./serving-schema.js";
@@ -55,6 +56,21 @@ const coingeckoHeaders = () => ({
 });
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const retryablePriceStatus = (status: number) => status === 429 || status >= 500;
+const retryDelayFromHeader = (value: string | null) => {
+  if (!value) {
+    return null;
+  }
+
+  const seconds = Number.parseFloat(value);
+
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, Math.round(seconds * 1_000));
+  }
+
+  const retryAt = Date.parse(value);
+  return Number.isNaN(retryAt) ? null : Math.max(0, retryAt - Date.now());
+};
 
 const priceRangeWindows = (days: string[]) => {
   if (days.length === 0) {
@@ -83,10 +99,16 @@ const fetchRangePrices = async ({
   coingeckoId,
   fromDay,
   toDay,
+  maxRetries,
+  retryDelayMs,
+  attempt = 0,
 }: {
   coingeckoId: string;
   fromDay: string;
   toDay: string;
+  maxRetries: number;
+  retryDelayMs: number;
+  attempt?: number;
 }) => {
   const fromTs = Math.floor(Date.parse(`${fromDay}T00:00:00Z`) / 1_000);
   const isTodayRange = toDay === nowDayText();
@@ -99,7 +121,32 @@ const fetchRangePrices = async ({
   );
 
   if (!response.ok) {
-    throw new Error(`CoinGecko range request failed status=${response.status} coingecko_id=${coingeckoId}`);
+    if (retryablePriceStatus(response.status) && attempt < maxRetries) {
+      const nextDelayMs = retryDelayFromHeader(response.headers.get("retry-after")) ?? retryDelayMs * 2 ** attempt;
+
+      logLine("retrying token price request", {
+        coingecko_id: coingeckoId,
+        status: response.status,
+        attempt: attempt + 1,
+        retry_in_ms: nextDelayMs,
+      });
+      await sleep(nextDelayMs);
+
+      return fetchRangePrices({
+        coingeckoId,
+        fromDay,
+        toDay,
+        maxRetries,
+        retryDelayMs,
+        attempt: attempt + 1,
+      });
+    }
+
+    const rateLimitHint =
+      response.status === 429
+        ? " rate_limited=1 try_higher_delay=1 try_smaller_limit=1 try_network_and_token_address_filters=1 try_coingecko_api_key=1"
+        : "";
+    throw new Error(`CoinGecko range request failed status=${response.status} coingecko_id=${coingeckoId}${rateLimitHint}`);
   }
 
   return (await response.json()) as CoinGeckoRangeResponse;
@@ -377,26 +424,29 @@ const loadMissingDays = async (token: PriceToken) => {
   }
 };
 
-export const refreshPrices = async ({
-  startDay = parseArgValue("start-day") ?? "2026-01-01",
-  activeDays = parseIntegerArg("active-days") ?? 1,
-  limit = parseIntegerArg("limit"),
-  backfillLimit = parseIntegerArg("backfill-limit") ?? 50,
-  network = normalizeNetwork(parseArgValue("network")),
-  tokenAddress = normalizeAddress(parseArgValue("token-address")),
-  requestDelayMs = parseIntegerArg("delay-ms") ?? 1250,
+const runPriceRefreshCycle = async ({
+  startDay,
+  activeDays,
+  limit,
+  backfillLimit,
+  network,
+  tokenAddress,
+  requestDelayMs,
+  maxRetries,
+  retryDelayMs,
+  currentDay,
 }: {
-  startDay?: string;
-  activeDays?: number;
-  limit?: number | null;
-  backfillLimit?: number;
-  network?: string | null;
-  tokenAddress?: string | null;
-  requestDelayMs?: number;
-} = {}) => {
-  await ensureServingSchema();
-  const startedAt = performance.now();
-  const currentDay = nowDayText();
+  startDay: string;
+  activeDays: number;
+  limit: number | null;
+  backfillLimit: number;
+  network: string | null;
+  tokenAddress: string | null;
+  requestDelayMs: number;
+  maxRetries: number;
+  retryDelayMs: number;
+  currentDay: string;
+}) => {
   const tokens = await loadTokenWork({
     startDay,
     activeDays,
@@ -404,13 +454,6 @@ export const refreshPrices = async ({
     tokenAddress,
     limit,
     backfillLimit,
-  });
-
-  logLine("starting price refresh", {
-    tokens: tokens.length,
-    start_day: startDay,
-    active_days: activeDays,
-    backfill_limit: backfillLimit,
   });
 
   let upsertedRows = 0;
@@ -441,6 +484,8 @@ export const refreshPrices = async ({
         coingeckoId: token.coingecko_id,
         fromDay: window.fromDay,
         toDay: window.toDay,
+        maxRetries,
+        retryDelayMs,
       });
       const rows = buildDailyPriceRows({
         network: token.network,
@@ -455,8 +500,89 @@ export const refreshPrices = async ({
     }
   }
 
-  logLine("completed price refresh", {
+  return {
     tokens: tokens.length,
+    upsertedRows,
+  };
+};
+
+export const refreshPrices = async ({
+  startDay = parseArgValue("start-day") ?? "2026-01-01",
+  activeDays = parseIntegerArg("active-days") ?? 1,
+  limit = parseIntegerArg("limit"),
+  backfillLimit = parseIntegerArg("backfill-limit") ?? 50,
+  network = normalizeNetwork(parseArgValue("network")),
+  tokenAddress = normalizeAddress(parseArgValue("token-address")),
+  requestDelayMs = parseIntegerArg("delay-ms") ?? 1250,
+  maxRetries = parseIntegerArg("max-retries") ?? 6,
+  retryDelayMs = parseIntegerArg("retry-delay-ms") ?? 15_000,
+  loopUntilEmpty = parseBool(parseArgValue("loop-until-empty")),
+}: {
+  startDay?: string;
+  activeDays?: number;
+  limit?: number | null;
+  backfillLimit?: number;
+  network?: string | null;
+  tokenAddress?: string | null;
+  requestDelayMs?: number;
+  maxRetries?: number;
+  retryDelayMs?: number;
+  loopUntilEmpty?: boolean;
+} = {}) => {
+  await ensureServingSchema();
+  const startedAt = performance.now();
+  const currentDay = nowDayText();
+
+  if (loopUntilEmpty && limit !== 0) {
+    throw new Error("loop-until-empty requires --limit=0 so active token refreshes do not keep the queue non-empty");
+  }
+
+  logLine("starting price refresh", {
+    start_day: startDay,
+    active_days: activeDays,
+    limit: limit ?? undefined,
+    backfill_limit: backfillLimit,
+    delay_ms: requestDelayMs,
+    max_retries: maxRetries,
+    retry_delay_ms: retryDelayMs,
+    loop_until_empty: loopUntilEmpty ? 1 : undefined,
+  });
+
+  let cycle = 0;
+  let totalTokens = 0;
+  let upsertedRows = 0;
+
+  while (true) {
+    cycle += 1;
+    const result = await runPriceRefreshCycle({
+      startDay,
+      activeDays,
+      limit,
+      backfillLimit,
+      network,
+      tokenAddress,
+      requestDelayMs,
+      maxRetries,
+      retryDelayMs,
+      currentDay,
+    });
+    totalTokens += result.tokens;
+    upsertedRows += result.upsertedRows;
+
+    logLine("completed price refresh cycle", {
+      cycle,
+      tokens: result.tokens,
+      upserted_rows: result.upsertedRows,
+    });
+
+    if (!loopUntilEmpty || result.tokens === 0) {
+      break;
+    }
+  }
+
+  logLine("completed price refresh", {
+    cycles: cycle,
+    tokens: totalTokens,
     upserted_rows: upsertedRows,
     duration_ms: Math.round(performance.now() - startedAt),
   });

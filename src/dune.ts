@@ -17,6 +17,7 @@ type DuneResultsResponse<T> = {
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const duneRequestTimeoutMs = 30_000;
 
 const requireApiKey = (value: string | undefined) => {
   if (!value) {
@@ -40,7 +41,21 @@ const parseJson = <T>(value: string) => {
 };
 
 const fetchJson = async <T>(input: string, init?: RequestInit, attempt = 0): Promise<T> => {
-  const response = await fetch(input, init);
+  let response: Response;
+
+  try {
+    response = await fetch(input, {
+      ...init,
+      signal: init?.signal ?? AbortSignal.timeout(duneRequestTimeoutMs),
+    });
+  } catch (error) {
+    if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+      throw new Error(`Dune API timeout: ${input}`);
+    }
+
+    throw error;
+  }
+
   const payloadText = await response.text();
   const payload = parseJson<T>(payloadText);
 
