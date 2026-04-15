@@ -3,29 +3,25 @@ import { ensureServingSchema } from "./serving-schema.js";
 import { logLine } from "./log.js";
 
 const enrichedInsertSql = `
-  with priced_flows as (
+  with reference_prices as (
     select
       leaderboards.network,
       leaderboards.token_address,
       leaderboards.window_days,
       leaderboards.metric,
       leaderboards.address,
-      case
-        when leaderboards.metric = 'net_inflow' then sum(flows.net_amount_native_sum * prices.median_price_usd)
-        when leaderboards.metric = 'net_outflow' then -sum(flows.net_amount_native_sum * prices.median_price_usd)
-        else null
-      end as amount_usd_sum
+      leaderboards.flow_rank,
+      latest_price.median_price_usd
     from token_flow_leaderboards as leaderboards
-    inner join token_daily_address_flows as flows
-      on flows.network = leaderboards.network
-     and flows.token_address = leaderboards.token_address
-     and flows.address = leaderboards.address
-     and flows.day between leaderboards.window_start_day and leaderboards.window_end_day
-    left join token_price_daily as prices
-      on prices.network = flows.network
-     and prices.token_address = flows.token_address
-     and prices.day = flows.day
-    group by 1, 2, 3, 4, 5
+    left join lateral (
+      select prices.median_price_usd
+      from token_price_daily as prices
+      where prices.network = leaderboards.network
+        and prices.token_address = leaderboards.token_address
+        and prices.day <= leaderboards.window_end_day
+      order by prices.day desc
+      limit 1
+    ) as latest_price on true
   )
   insert into token_flow_leaderboards_enriched (
     network,
@@ -82,11 +78,16 @@ const enrichedInsertSql = `
     leaderboards.flow_rank,
     leaderboards.transfer_count,
     leaderboards.amount_native_sum,
-    priced_flows.amount_usd_sum,
+    case
+      when leaderboards.metric in ('net_inflow', 'net_outflow') and reference_prices.median_price_usd is not null
+        then leaderboards.amount_native_sum * reference_prices.median_price_usd
+      else null
+    end as amount_usd_sum,
     leaderboards.avg_amount_native,
     case
-      when leaderboards.transfer_count = 0 or priced_flows.amount_usd_sum is null then null
-      else priced_flows.amount_usd_sum / leaderboards.transfer_count
+      when leaderboards.metric in ('net_inflow', 'net_outflow') and reference_prices.median_price_usd is not null
+        then leaderboards.avg_amount_native * reference_prices.median_price_usd
+      else null
     end as avg_amount_usd,
     labels.label,
     labels.category,
@@ -102,12 +103,13 @@ const enrichedInsertSql = `
     labels.external_added_at,
     leaderboards.as_of_ts
   from token_flow_leaderboards as leaderboards
-  left join priced_flows
-    on priced_flows.network = leaderboards.network
-   and priced_flows.token_address = leaderboards.token_address
-   and priced_flows.window_days = leaderboards.window_days
-   and priced_flows.metric = leaderboards.metric
-   and priced_flows.address = leaderboards.address
+  left join reference_prices
+    on reference_prices.network = leaderboards.network
+   and reference_prices.token_address = leaderboards.token_address
+   and reference_prices.window_days = leaderboards.window_days
+   and reference_prices.metric = leaderboards.metric
+   and reference_prices.address = leaderboards.address
+   and reference_prices.flow_rank = leaderboards.flow_rank
   left join address_labels as labels
     on labels.network = leaderboards.network
    and labels.address = leaderboards.address
@@ -120,29 +122,25 @@ const scopedEnrichedInsertSql = `
     where ($1::text is null or network = $1)
       and ($2::text is null or token_address = $2)
   ),
-  priced_flows as (
+  reference_prices as (
     select
       leaderboards.network,
       leaderboards.token_address,
       leaderboards.window_days,
       leaderboards.metric,
       leaderboards.address,
-      case
-        when leaderboards.metric = 'net_inflow' then sum(flows.net_amount_native_sum * prices.median_price_usd)
-        when leaderboards.metric = 'net_outflow' then -sum(flows.net_amount_native_sum * prices.median_price_usd)
-        else null
-      end as amount_usd_sum
+      leaderboards.flow_rank,
+      latest_price.median_price_usd
     from scoped_leaderboards as leaderboards
-    inner join token_daily_address_flows as flows
-      on flows.network = leaderboards.network
-     and flows.token_address = leaderboards.token_address
-     and flows.address = leaderboards.address
-     and flows.day between leaderboards.window_start_day and leaderboards.window_end_day
-    left join token_price_daily as prices
-      on prices.network = flows.network
-     and prices.token_address = flows.token_address
-     and prices.day = flows.day
-    group by 1, 2, 3, 4, 5
+    left join lateral (
+      select prices.median_price_usd
+      from token_price_daily as prices
+      where prices.network = leaderboards.network
+        and prices.token_address = leaderboards.token_address
+        and prices.day <= leaderboards.window_end_day
+      order by prices.day desc
+      limit 1
+    ) as latest_price on true
   )
   insert into token_flow_leaderboards_enriched (
     network,
@@ -199,11 +197,16 @@ const scopedEnrichedInsertSql = `
     leaderboards.flow_rank,
     leaderboards.transfer_count,
     leaderboards.amount_native_sum,
-    priced_flows.amount_usd_sum,
+    case
+      when leaderboards.metric in ('net_inflow', 'net_outflow') and reference_prices.median_price_usd is not null
+        then leaderboards.amount_native_sum * reference_prices.median_price_usd
+      else null
+    end as amount_usd_sum,
     leaderboards.avg_amount_native,
     case
-      when leaderboards.transfer_count = 0 or priced_flows.amount_usd_sum is null then null
-      else priced_flows.amount_usd_sum / leaderboards.transfer_count
+      when leaderboards.metric in ('net_inflow', 'net_outflow') and reference_prices.median_price_usd is not null
+        then leaderboards.avg_amount_native * reference_prices.median_price_usd
+      else null
     end as avg_amount_usd,
     labels.label,
     labels.category,
@@ -219,12 +222,13 @@ const scopedEnrichedInsertSql = `
     labels.external_added_at,
     leaderboards.as_of_ts
   from scoped_leaderboards as leaderboards
-  left join priced_flows
-    on priced_flows.network = leaderboards.network
-   and priced_flows.token_address = leaderboards.token_address
-   and priced_flows.window_days = leaderboards.window_days
-   and priced_flows.metric = leaderboards.metric
-   and priced_flows.address = leaderboards.address
+  left join reference_prices
+    on reference_prices.network = leaderboards.network
+   and reference_prices.token_address = leaderboards.token_address
+   and reference_prices.window_days = leaderboards.window_days
+   and reference_prices.metric = leaderboards.metric
+   and reference_prices.address = leaderboards.address
+   and reference_prices.flow_rank = leaderboards.flow_rank
   left join address_labels as labels
     on labels.network = leaderboards.network
    and labels.address = leaderboards.address

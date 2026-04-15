@@ -154,16 +154,20 @@ const buildDailyPriceRows = ({
     })
     .filter((row): row is DailyPriceRow => row !== null);
 
+const currentTokenMapSql = `
+  select distinct on (network, token_address)
+    network,
+    token_address,
+    coingecko_id
+  from token_flow_leaderboards
+  where coingecko_id is not null
+    and coingecko_id <> ''
+  order by network, token_address, as_of_ts desc, window_end_day desc, flow_rank asc, coingecko_id desc
+`;
+
 const listActiveTokensSql = `
   with token_map as (
-    select
-      network,
-      token_address,
-      max(coingecko_id) as coingecko_id
-    from token_flow_leaderboards
-    where coingecko_id is not null
-      and coingecko_id <> ''
-    group by 1, 2
+    ${currentTokenMapSql}
   ),
   flow_bounds as (
     select
@@ -210,16 +214,7 @@ const listBackfillTokensSql = `
       where day >= $1::date
       group by 1, 2
     ) as bounds
-    inner join (
-      select
-        network,
-        token_address,
-        max(coingecko_id) as coingecko_id
-      from token_flow_leaderboards
-      where coingecko_id is not null
-        and coingecko_id <> ''
-      group by 1, 2
-    ) as token_ids
+    inner join (${currentTokenMapSql}) as token_ids
       on token_ids.network = bounds.network
      and token_ids.token_address = bounds.token_address
     where ($2::text is null or bounds.network = $2)
@@ -248,7 +243,7 @@ const listBackfillTokensSql = `
       on prices.network = expected.network
      and prices.token_address = expected.token_address
      and prices.day = expected.day
-    where prices.day is null
+    where (prices.day is null or prices.coingecko_id <> expected.coingecko_id)
       and expected.day < current_date
     group by 1, 2, 3
   )
@@ -274,7 +269,7 @@ const listMissingDaysSql = `
     on prices.network = $1
    and prices.token_address = $2
    and prices.day = expected_days.day
-  where prices.day is null
+  where prices.day is null or prices.coingecko_id <> $5
   order by expected_days.day
 `;
 
@@ -374,6 +369,7 @@ const loadMissingDays = async (token: PriceToken) => {
       token.token_address,
       token.first_flow_day,
       token.last_flow_day,
+      token.coingecko_id,
     ]);
     return result.rows.map((row) => row.day);
   } finally {

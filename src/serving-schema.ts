@@ -14,7 +14,7 @@ const normalizedNetworkSql = (column: string) => `
   end
 `;
 
-const createServingSchemaSql = `
+const legacyServingSchemaSql = `
   do $$
   begin
     begin
@@ -41,6 +41,31 @@ const createServingSchemaSql = `
     end if;
   end
   $$;
+
+  do $$
+  begin
+    if to_regclass('public.token_flow_daily_totals') is not null then
+      update token_flow_daily_totals
+      set network = ${normalizedNetworkSql("network")}
+      where network <> ${normalizedNetworkSql("network")};
+    end if;
+
+    if to_regclass('public.token_flow_leaderboards') is not null then
+      update token_flow_leaderboards
+      set network = ${normalizedNetworkSql("network")}
+      where network <> ${normalizedNetworkSql("network")};
+    end if;
+
+    if to_regclass('public.token_daily_address_flows') is not null then
+      update token_daily_address_flows
+      set network = ${normalizedNetworkSql("network")}
+      where network <> ${normalizedNetworkSql("network")};
+    end if;
+  end
+  $$;
+`;
+
+const createServingSchemaSql = `
 
   create table if not exists token_flow_daily_totals (
     network text not null,
@@ -239,31 +264,24 @@ const createServingSchemaSql = `
 
   create index if not exists idx_token_flow_leaderboards_enriched_address
     on token_flow_leaderboards_enriched (network, address);
-
-  update token_flow_daily_totals
-  set network = ${normalizedNetworkSql("network")}
-  where network <> ${normalizedNetworkSql("network")};
-
-  update token_flow_leaderboards
-  set network = ${normalizedNetworkSql("network")}
-  where network <> ${normalizedNetworkSql("network")};
-
-  update token_daily_address_flows
-  set network = ${normalizedNetworkSql("network")}
-  where network <> ${normalizedNetworkSql("network")};
 `;
 
 const servingSchemaLockKey = 20_260_410;
 
-export const ensureServingSchema = async () => {
+const runServingSchemaSql = async (sql: string) => {
   const client = createServingClient();
   await client.connect();
 
   try {
     await client.query("select pg_advisory_lock($1)", [servingSchemaLockKey]);
-    await client.query(createServingSchemaSql);
+    await client.query(sql);
   } finally {
     await client.query("select pg_advisory_unlock($1)", [servingSchemaLockKey]).catch(() => undefined);
     await client.end();
   }
 };
+
+export const ensureServingSchema = async () => runServingSchemaSql(createServingSchemaSql);
+
+export const migrateServingSchemaLegacy = async () =>
+  runServingSchemaSql(`${legacyServingSchemaSql}\n${createServingSchemaSql}`);
