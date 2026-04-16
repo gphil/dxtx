@@ -45,6 +45,10 @@ type DailyPriceRow = {
   updated_at: Date;
 };
 
+type PriceRefreshError = Error & {
+  status?: number;
+};
+
 const maxRangeDays = 30;
 
 const coingeckoBaseUrl = () =>
@@ -146,7 +150,11 @@ const fetchRangePrices = async ({
       response.status === 429
         ? " rate_limited=1 try_higher_delay=1 try_smaller_limit=1 try_network_and_token_address_filters=1 try_coingecko_api_key=1"
         : "";
-    throw new Error(`CoinGecko range request failed status=${response.status} coingecko_id=${coingeckoId}${rateLimitHint}`);
+    const error = new Error(
+      `CoinGecko range request failed status=${response.status} coingecko_id=${coingeckoId}${rateLimitHint}`,
+    ) as PriceRefreshError;
+    error.status = response.status;
+    throw error;
   }
 
   return (await response.json()) as CoinGeckoRangeResponse;
@@ -239,6 +247,7 @@ const listActiveTokensSql = `
   where bounds.last_flow_day >= current_date - ($2::integer * interval '1 day')
     and ($3::text is null or bounds.network = $3)
     and ($4::text is null or bounds.token_address = lower($4))
+    and not (bounds.network || ':' || bounds.token_address = any($6::text[]))
   order by bounds.last_flow_day desc, bounds.network, bounds.token_address
   limit coalesce($5::integer, 1000000)
 `;
@@ -266,6 +275,7 @@ const listBackfillTokensSql = `
      and token_ids.token_address = bounds.token_address
     where ($2::text is null or bounds.network = $2)
       and ($3::text is null or bounds.token_address = lower($3))
+      and not (bounds.network || ':' || bounds.token_address = any($5::text[]))
   ),
   expected_days as (
     select
@@ -367,6 +377,7 @@ const loadTokenWork = async ({
   tokenAddress,
   limit,
   backfillLimit,
+  skippedTokenKeys,
 }: {
   startDay: string;
   activeDays: number;
@@ -374,23 +385,27 @@ const loadTokenWork = async ({
   tokenAddress: string | null;
   limit: number | null;
   backfillLimit: number;
+  skippedTokenKeys: Set<string>;
 }) => {
   const client = createServingClient();
   await client.connect();
 
   try {
+    const excludedKeys = [...skippedTokenKeys];
     const activeTokens = await client.query<PriceToken>(listActiveTokensSql, [
       startDay,
       activeDays,
       network,
       tokenAddress,
       limit,
+      excludedKeys,
     ]);
     const backfillTokens = await client.query<PriceToken>(listBackfillTokensSql, [
       startDay,
       network,
       tokenAddress,
       backfillLimit,
+      excludedKeys,
     ]);
     const byKey = [...activeTokens.rows, ...backfillTokens.rows].reduce<Record<string, PriceToken>>(
       (result, token) => ({
@@ -435,6 +450,7 @@ const runPriceRefreshCycle = async ({
   maxRetries,
   retryDelayMs,
   currentDay,
+  skippedTokenKeys,
 }: {
   startDay: string;
   activeDays: number;
@@ -446,6 +462,7 @@ const runPriceRefreshCycle = async ({
   maxRetries: number;
   retryDelayMs: number;
   currentDay: string;
+  skippedTokenKeys: Set<string>;
 }) => {
   const tokens = await loadTokenWork({
     startDay,
@@ -454,11 +471,15 @@ const runPriceRefreshCycle = async ({
     tokenAddress,
     limit,
     backfillLimit,
+    skippedTokenKeys,
   });
 
   let upsertedRows = 0;
+  let failedTokens = 0;
+  let emptyTokens = 0;
 
   for (const token of tokens) {
+    const tokenKey = `${token.network}:${token.token_address}`;
     const missingDays = await loadMissingDays(token);
     const requestedDays = [...missingDays, ...(token.last_flow_day >= currentDay ? [currentDay] : [])].filter(
       (day, index, values) =>
@@ -479,30 +500,66 @@ const runPriceRefreshCycle = async ({
       to_day: windows[windows.length - 1]?.toDay,
     });
 
-    for (const window of windows) {
-      const rangeResponse = await fetchRangePrices({
-        coingeckoId: token.coingecko_id,
-        fromDay: window.fromDay,
-        toDay: window.toDay,
-        maxRetries,
-        retryDelayMs,
-      });
-      const rows = buildDailyPriceRows({
-        network: token.network,
-        tokenAddress: token.token_address,
-        coingeckoId: token.coingecko_id,
-        prices: rangeResponse.prices || [],
-        currentDay,
-      }).filter((row) => row.day >= window.fromDay && row.day <= window.toDay);
+    let tokenUpsertedRows = 0;
 
-      upsertedRows += await upsertDailyPrices(rows);
-      await sleep(requestDelayMs);
+    for (const window of windows) {
+      try {
+        const rangeResponse = await fetchRangePrices({
+          coingeckoId: token.coingecko_id,
+          fromDay: window.fromDay,
+          toDay: window.toDay,
+          maxRetries,
+          retryDelayMs,
+        });
+        const rows = buildDailyPriceRows({
+          network: token.network,
+          tokenAddress: token.token_address,
+          coingeckoId: token.coingecko_id,
+          prices: rangeResponse.prices || [],
+          currentDay,
+        }).filter((row) => row.day >= window.fromDay && row.day <= window.toDay);
+        const insertedRows = await upsertDailyPrices(rows);
+
+        upsertedRows += insertedRows;
+        tokenUpsertedRows += insertedRows;
+        await sleep(requestDelayMs);
+      } catch (error) {
+        const priceError = error as PriceRefreshError;
+
+        if (priceError.status === 429 || priceError.status === 401 || priceError.status === 403) {
+          throw error;
+        }
+
+        failedTokens += 1;
+        skippedTokenKeys.add(tokenKey);
+        logLine("deferred token price refresh", {
+          network: token.network,
+          token_address: token.token_address,
+          coingecko_id: token.coingecko_id,
+          from_day: window.fromDay,
+          to_day: window.toDay,
+          error: priceError instanceof Error ? priceError.message : String(priceError),
+        });
+        break;
+      }
+    }
+
+    if (!skippedTokenKeys.has(tokenKey) && tokenUpsertedRows === 0) {
+      emptyTokens += 1;
+      skippedTokenKeys.add(tokenKey);
+      logLine("deferred token prices with no rows", {
+        network: token.network,
+        token_address: token.token_address,
+        coingecko_id: token.coingecko_id,
+      });
     }
   }
 
   return {
     tokens: tokens.length,
     upsertedRows,
+    failedTokens,
+    emptyTokens,
   };
 };
 
@@ -551,6 +608,9 @@ export const refreshPrices = async ({
   let cycle = 0;
   let totalTokens = 0;
   let upsertedRows = 0;
+  let failedTokens = 0;
+  let emptyTokens = 0;
+  const skippedTokenKeys = new Set<string>();
 
   while (true) {
     cycle += 1;
@@ -565,14 +625,20 @@ export const refreshPrices = async ({
       maxRetries,
       retryDelayMs,
       currentDay,
+      skippedTokenKeys,
     });
     totalTokens += result.tokens;
     upsertedRows += result.upsertedRows;
+    failedTokens += result.failedTokens;
+    emptyTokens += result.emptyTokens;
 
     logLine("completed price refresh cycle", {
       cycle,
       tokens: result.tokens,
       upserted_rows: result.upsertedRows,
+      failed_tokens: result.failedTokens,
+      empty_tokens: result.emptyTokens,
+      deferred_tokens: skippedTokenKeys.size,
     });
 
     if (!loopUntilEmpty || result.tokens === 0) {
@@ -584,8 +650,15 @@ export const refreshPrices = async ({
     cycles: cycle,
     tokens: totalTokens,
     upserted_rows: upsertedRows,
+    failed_tokens: failedTokens,
+    empty_tokens: emptyTokens,
+    deferred_tokens: skippedTokenKeys.size,
     duration_ms: Math.round(performance.now() - startedAt),
   });
+
+  if (loopUntilEmpty && skippedTokenKeys.size > 0) {
+    throw new Error(`price refresh completed with unresolved deferred tokens=${skippedTokenKeys.size}`);
+  }
 };
 
 if (isDirectRun(import.meta.url)) {

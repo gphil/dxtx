@@ -287,6 +287,10 @@ const wethSpotSql = `
 
 const toNumber = (value: string | number | null | undefined) => Number(value ?? 0);
 const formatNumber = (value: string | number | null | undefined, digits = 4) => {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+
   const number = toNumber(value);
   return Number.isFinite(number) ? number.toFixed(digits) : undefined;
 };
@@ -305,16 +309,13 @@ const main = async () => {
   await client.connect();
 
   try {
-    const [coverage, priceMismatches, enrichedConsistency, enrichedMissingUsd, topGaps, badSamples, wethSpot] =
-      await Promise.all([
-        client.query<PriceCoverageRow>(priceCoverageSql, [startDay]),
-        client.query<CountRow>(priceIdMismatchSql),
-        client.query<EnrichedConsistencyRow>(enrichedConsistencySql, [threshold]),
-        client.query<EnrichedMissingUsdRow>(enrichedMissingUsdSql),
-        client.query<PriceGapRow>(topPriceGapsSql, [startDay, sampleLimit]),
-        client.query<EnrichedBadSampleRow>(enrichedBadSamplesSql, [threshold, sampleLimit]),
-        client.query<WethSpotRow>(wethSpotSql),
-      ]);
+    const coverage = await client.query<PriceCoverageRow>(priceCoverageSql, [startDay]);
+    const priceMismatches = await client.query<CountRow>(priceIdMismatchSql);
+    const enrichedConsistency = await client.query<EnrichedConsistencyRow>(enrichedConsistencySql, [threshold]);
+    const enrichedMissingUsd = await client.query<EnrichedMissingUsdRow>(enrichedMissingUsdSql);
+    const topGaps = await client.query<PriceGapRow>(topPriceGapsSql, [startDay, sampleLimit]);
+    const badSamples = await client.query<EnrichedBadSampleRow>(enrichedBadSamplesSql, [threshold, sampleLimit]);
+    const wethSpot = await client.query<WethSpotRow>(wethSpotSql);
 
     const coverageRow = coverage.rows[0];
     const consistencyRow = enrichedConsistency.rows[0];
