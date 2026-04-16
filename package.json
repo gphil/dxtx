@@ -25,6 +25,7 @@
     "sync:all": "node --require=dotenv/config lib/all/sync-all.js",
     "sync:labels": "node --require=dotenv/config lib/sync-labels.js",
     "migrate:serving-schema": "node --require=dotenv/config lib/migrate-serving-schema.js",
+    "check:prices": "node --require=dotenv/config lib/check-prices.js",
     "inspect:flows": "node --require=dotenv/config lib/inspect-flows.js",
     "verify:flows": "node --require=dotenv/config lib/verify-flows.js",
     "check:cache": "node --require=dotenv/config lib/check-cache.js",
