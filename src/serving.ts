@@ -214,8 +214,13 @@ export const buildCompositeDeleteSql = ({
   };
 };
 
-export const parseArgValue = (name: string) =>
-  process.argv.slice(2).find((arg) => arg.startsWith(`--${name}=`))?.slice(name.length + 3) ?? null;
+export const parseArgValue = (name: string) => {
+  const flag = `--${name}`;
+  const prefix = `${flag}=`;
+  const arg = process.argv.slice(2).find((value) => value === flag || value.startsWith(prefix));
+
+  return arg === undefined ? null : arg === flag ? "true" : arg.slice(prefix.length);
+};
 
 export const parseIntegerArg = (name: string) => {
   const value = parseArgValue(name);

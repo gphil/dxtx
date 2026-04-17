@@ -44,6 +44,12 @@ Check block freshness against the current SQD archive height:
 npm run check:freshness -- base
 ```
 
+Check serving Postgres disk usage by relation and index:
+
+```bash
+npm run check:postgres-size -- --limit=30
+```
+
 Build or refresh a local analytics database for one chain:
 
 ```bash
@@ -139,6 +145,8 @@ sqd process:all
   max number of new cache chunks to process per sync pass; defaults to `32`
 - `ANALYTICS_MEMORY_LIMIT`
   DuckDB memory cap for flow sync workers; defaults to `4GB`
+- `ANALYTICS_TEMP_DIRECTORY`
+  DuckDB temp/spill directory for flow sync workers; defaults to `./analytics/<chain>-flow-sync-tmp`
 - `ANALYTICS_THREADS`
   DuckDB thread count for flow sync workers
 - `FLOW_SYNC_LOOP`
@@ -165,6 +173,7 @@ Per-chain overrides use the same suffix pattern:
 - `CACHE_TARGET_LIMIT_BASE`
 - `FLOW_SYNC_MAX_CHUNKS_BSC`
 - `ANALYTICS_MEMORY_LIMIT_BSC`
+- `ANALYTICS_TEMP_DIRECTORY_BSC`
 - `ANALYTICS_THREADS_BSC`
 
 ## Output
@@ -183,7 +192,7 @@ Resume is cache-first. The publisher resumes from the last flushed transfer chun
 - Run `sync:flows` against a separate local DuckDB database on the indexer box.
 - Run a local Dockerized Postgres for serving tables with `npm run db:up`.
 - Let `npm run sync:flows` fan out to one worker per selected chain in loop mode, with each chain keeping its own local DuckDB file.
-- In loop mode, failed flow-sync workers are restarted automatically, and DuckDB OOM failures back off to smaller chunk batches automatically.
+- In loop mode, failed flow-sync workers are restarted automatically, and DuckDB memory/temp-space failures back off to smaller chunk batches automatically.
 - Let `sync:flows` process only new parquet chunks and maintain:
   - `processed_flow_chunks`
   - `token_daily_totals`

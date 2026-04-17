@@ -1493,7 +1493,9 @@ const listUncheckedCandidates = async ({
   recheckDays: number;
   supportedNetworks: Set<string>;
 }) => {
-  if (limit <= 0) {
+  const networks = [...supportedNetworks];
+
+  if (limit <= 0 || networks.length === 0) {
     return [] as Array<{ network: string; address: string }>;
   }
 
@@ -1520,6 +1522,7 @@ const listUncheckedCandidates = async ({
          and checks.address = leaderboards.address
         where leaderboards.address <> $2
           and leaderboards.metric in ('net_inflow', 'net_outflow')
+          and leaderboards.network = any($5::text[])
           and address_labels.address is null
           and (checks.checked_at is null or checks.checked_at < now() - $3::interval)
         group by leaderboards.network, leaderboards.address
@@ -1529,10 +1532,10 @@ const listUncheckedCandidates = async ({
       order by estimated_usd desc nulls last, best_flow_rank asc, row_count desc, network asc, address asc
       limit $4
     `,
-    [sourceName, zeroAddress, `${recheckDays} days`, limit],
+    [sourceName, zeroAddress, `${recheckDays} days`, limit, networks],
   );
 
-  return result.rows.filter((row) => supportedNetworks.has(row.network));
+  return result.rows;
 };
 
 const listSourcifyCandidates = ({

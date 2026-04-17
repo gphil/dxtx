@@ -11,6 +11,7 @@ const workerEntryPath = join(currentDir, "..", "sync-flows.js");
 const maxRecentLines = 20;
 const restartScheduleMs = [5_000, 10_000, 30_000, 60_000, 120_000];
 const oomPattern = /Out of Memory Error|could not allocate block/i;
+const tempSpacePattern = /No space left on device|ENOSPC|duckdb_temp_storage/i;
 const restartDelayMs = (attempt: number) =>
   restartScheduleMs[Math.min(attempt, restartScheduleMs.length - 1)] ?? 120_000;
 const normalizeEnvName = (chain: Chain) => chain.toUpperCase();
@@ -114,6 +115,20 @@ type ChildExit = {
 
 const recentFailureLine = (recentLines: string[]) => [...recentLines].reverse()[0];
 
+const resourcePressureKind = (recentLines: string[]) => {
+  const output = recentLines.join("\n");
+
+  if (oomPattern.test(output)) {
+    return "memory";
+  }
+
+  if (tempSpacePattern.test(output)) {
+    return "temp_space";
+  }
+
+  return undefined;
+};
+
 const childEnv = (chain: Chain, overrides: WorkerOverrides) => ({
   ...process.env,
   ...(overrides.maxChunks === undefined
@@ -124,7 +139,7 @@ const childEnv = (chain: Chain, overrides: WorkerOverrides) => ({
     : { [chainEnvKey("ANALYTICS_THREADS", chain)]: String(overrides.threads) }),
 });
 
-const nextOverridesOnOom = (chain: Chain, overrides: WorkerOverrides): WorkerOverrides => {
+const nextOverridesOnResourcePressure = (chain: Chain, overrides: WorkerOverrides): WorkerOverrides => {
   const currentMaxChunks = overrides.maxChunks ?? configuredMaxChunks(chain);
   const currentThreads = overrides.threads ?? configuredThreads(chain) ?? 1;
 
@@ -179,12 +194,29 @@ const runChainLoop = async (chain: Chain) => {
       return;
     }
 
-    const nextOverrides = oomPattern.test(result.recentLines.join("\n"))
-      ? nextOverridesOnOom(chain, overrides)
+    const resourcePressure = resourcePressureKind(result.recentLines);
+    const nextOverrides = resourcePressure
+      ? nextOverridesOnResourcePressure(chain, overrides)
       : overrides;
     const overridesChanged =
       nextOverrides.maxChunks !== overrides.maxChunks || nextOverrides.threads !== overrides.threads;
     overrides = nextOverrides;
+
+    if (resourcePressure && !overridesChanged) {
+      const error = recentFailureLine(result.recentLines);
+      logLine("flow sync worker exhausted resource backoff", {
+        chain,
+        resource_pressure: resourcePressure,
+        max_chunks: overrides.maxChunks,
+        threads: overrides.threads,
+        exit_code: result.code ?? undefined,
+        signal: result.signal ?? undefined,
+        error,
+      });
+      throw new Error(
+        `chain=${chain} exhausted ${resourcePressure} backoff with max_chunks=${overrides.maxChunks ?? configuredMaxChunks(chain)} threads=${overrides.threads ?? configuredThreads(chain) ?? 1}${error ? ` recent=${error}` : ""}`,
+      );
+    }
 
     const backoffMs = restartDelayMs(restartCount);
     restartCount += 1;
@@ -198,7 +230,8 @@ const runChainLoop = async (chain: Chain) => {
       error: recentFailureLine(result.recentLines),
       auto_max_chunks: overrides.maxChunks,
       auto_threads: overrides.threads,
-      oom_backoff: overridesChanged ? 1 : undefined,
+      resource_pressure: resourcePressure,
+      resource_backoff: overridesChanged ? 1 : undefined,
     });
 
     await sleep(backoffMs);

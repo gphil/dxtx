@@ -26,6 +26,7 @@
     "sync:labels": "node --require=dotenv/config lib/sync-labels.js",
     "migrate:serving-schema": "node --require=dotenv/config lib/migrate-serving-schema.js",
     "check:prices": "node --require=dotenv/config lib/check-prices.js",
+    "check:postgres-size": "node --require=dotenv/config lib/check-postgres-size.js",
     "inspect:flows": "node --require=dotenv/config lib/inspect-flows.js",
     "verify:flows": "node --require=dotenv/config lib/verify-flows.js",
     "check:cache": "node --require=dotenv/config lib/check-cache.js",

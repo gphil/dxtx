@@ -113,7 +113,7 @@ const localDatabasePath = (chain: Chain) =>
   process.env.FLOW_SYNC_DB_PATH || `./analytics/${chain}-flow-sync.duckdb`;
 
 const tempDirectory = (chain: Chain) =>
-  process.env.ANALYTICS_TEMP_DIRECTORY || `./analytics/${chain}-flow-sync-tmp`;
+  chainEnvValue("ANALYTICS_TEMP_DIRECTORY", chain) || `./analytics/${chain}-flow-sync-tmp`;
 
 const createConnection = async (databasePath: string) => {
   const instance = await DuckDBInstance.create(databasePath);
@@ -1192,13 +1192,15 @@ const deleteAffectedLeaderboardRows = async ({
 const exportToPostgres = async ({
   connection,
   chain,
-  fullRebuild,
+  dailyFullRebuild,
+  leaderboardFullRebuild,
   includeLeaderboards,
   latestDay,
 }: {
   connection: DuckDBConnection;
   chain: Chain;
-  fullRebuild: boolean;
+  dailyFullRebuild: boolean;
+  leaderboardFullRebuild: boolean;
   includeLeaderboards: boolean;
   latestDay: string;
 }) => {
@@ -1211,7 +1213,7 @@ const exportToPostgres = async ({
 
   const asOfTs = new Date().toISOString();
   const affectedTokens =
-    includeLeaderboards && !fullRebuild
+    includeLeaderboards && !leaderboardFullRebuild
       ? await rows<TokenExportRow>(connection, affectedTokensSql)
       : [];
   const client = new Client({ connectionString: databaseUrl });
@@ -1224,7 +1226,7 @@ const exportToPostgres = async ({
   try {
     await client.query("begin");
 
-    if (fullRebuild) {
+    if (dailyFullRebuild) {
       await client.query("delete from token_daily_address_flows where network = $1", [network]);
     }
 
@@ -1240,7 +1242,7 @@ const exportToPostgres = async ({
     ];
     await streamRows<DailyTotalExportRow>(
       connection,
-      dailyTotalsExportSql({ asOfTs, latestDay, fullRebuild, network }),
+      dailyTotalsExportSql({ asOfTs, latestDay, fullRebuild: dailyFullRebuild, network }),
       async (batch) => {
         dailyTotalsCount += batch.length;
         await upsertRowBatch({
@@ -1278,7 +1280,7 @@ const exportToPostgres = async ({
     ];
     await streamRows<DailyAddressFlowExportRow>(
       connection,
-      dailyAddressFlowsExportSql({ asOfTs, latestDay, fullRebuild, network }),
+      dailyAddressFlowsExportSql({ asOfTs, latestDay, fullRebuild: dailyFullRebuild, network }),
       async (batch) => {
         dailyAddressFlowsCount += batch.length;
         await upsertRowBatch({
@@ -1297,7 +1299,7 @@ const exportToPostgres = async ({
         client,
         network,
         tokens: affectedTokens,
-        fullRebuild,
+        fullRebuild: leaderboardFullRebuild,
       });
     }
 
@@ -1326,7 +1328,7 @@ const exportToPostgres = async ({
       ];
       await streamRows<LeaderboardExportRow>(
         connection,
-        leaderboardExportSql({ asOfTs, fullRebuild, network }),
+        leaderboardExportSql({ asOfTs, fullRebuild: leaderboardFullRebuild, network }),
         async (batch) => {
           leaderboardCount += batch.length;
           await upsertRowBatch({
@@ -1348,7 +1350,8 @@ const exportToPostgres = async ({
       daily_address_flow_rows: dailyAddressFlowsCount,
       leaderboard_rows: includeLeaderboards ? leaderboardCount : undefined,
       deferred_leaderboards: includeLeaderboards ? undefined : 1,
-      full_rebuild: fullRebuild ? 1 : undefined,
+      daily_full_rebuild: dailyFullRebuild ? 1 : undefined,
+      leaderboard_full_rebuild: leaderboardFullRebuild ? 1 : undefined,
     });
   } catch (error) {
     await client.query("rollback");
@@ -1470,7 +1473,8 @@ const syncPass = async ({
       await exportToPostgres({
         connection,
         chain,
-        fullRebuild: true,
+        dailyFullRebuild: true,
+        leaderboardFullRebuild: true,
         includeLeaderboards: true,
         latestDay,
       });
@@ -1514,8 +1518,8 @@ const syncPass = async ({
 
   const currentDay = new Date().toISOString().slice(0, 10);
   const previousLeaderboardDay = await selectLatestLeaderboardDay(connection);
-  const fullRebuild = previousLeaderboardDay !== latestDay;
-  const includeLeaderboards = !(fullRebuild && remainingChunks > 0 && isBeforeDay(latestDay, currentDay));
+  const leaderboardFullRebuild = previousLeaderboardDay !== latestDay;
+  const includeLeaderboards = !(leaderboardFullRebuild && remainingChunks > 0 && isBeforeDay(latestDay, currentDay));
 
   if (includeLeaderboards) {
     await run(
@@ -1523,7 +1527,7 @@ const syncPass = async ({
       refreshLeaderboardsSql({
         latestDay,
         currentDay,
-        fullRebuild,
+        fullRebuild: leaderboardFullRebuild,
       }),
     );
   } else {
@@ -1537,7 +1541,8 @@ const syncPass = async ({
   await exportToPostgres({
     connection,
     chain,
-    fullRebuild,
+    dailyFullRebuild: false,
+    leaderboardFullRebuild,
     includeLeaderboards,
     latestDay,
   });
@@ -1548,7 +1553,7 @@ const syncPass = async ({
     remaining_chunks: remainingChunks,
     latest_day: latestDay,
     deferred_leaderboards: includeLeaderboards ? undefined : 1,
-    full_rebuild: fullRebuild ? 1 : undefined,
+    leaderboard_full_rebuild: leaderboardFullRebuild ? 1 : undefined,
   });
 
   return {

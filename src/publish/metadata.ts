@@ -6,7 +6,7 @@ import { normalizeAddress } from "../format.js";
 import type { Chain, TokenMetadata, TokenTarget } from "../types.js";
 
 const defaultRpcBatchSize = 25;
-let sharedMetadataPromise: Promise<Map<string, TokenMetadata>> | null = null;
+let sharedMetadataPromise: Promise<Map<string, TokenMetadata> | null> | null = null;
 
 const chunkValues = <T>(values: T[], size: number) =>
   Array.from({ length: Math.ceil(values.length / size) }, (_, index) =>
@@ -15,16 +15,34 @@ const chunkValues = <T>(values: T[], size: number) =>
 
 const sharedMetadataPath = () => process.env.DXTX_SHARED_METADATA_PATH;
 
+const errorMessage = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
+
+const errorCode = (error: unknown) =>
+  error && typeof error === "object" && "code" in error ? String((error as { code: unknown }).code) : undefined;
+
 const loadSharedMetadata = async () => {
   const path = sharedMetadataPath();
 
   if (!path) {
-    return new Map<string, TokenMetadata>();
+    return null;
   }
 
   sharedMetadataPromise ??= readFile(path, "utf8")
     .then((value) => JSON.parse(value) as TokenMetadata[])
-    .then((tokens) => new Map(tokens.map((token) => [`${token.chain}:${token.address}`, token] as const)));
+    .then((tokens) => new Map(tokens.map((token) => [`${token.chain}:${token.address}`, token] as const)))
+    .catch((error) => {
+      if (errorCode(error) !== "ENOENT") {
+        throw error;
+      }
+
+      logLine("skipped missing shared token metadata", {
+        path,
+        error: errorMessage(error),
+      });
+
+      return null;
+    });
 
   return sharedMetadataPromise;
 };
@@ -43,11 +61,11 @@ export const resolveTokenMetadata = async ({
   const targetAddresses = [...new Set(targets.map((target) => normalizeAddress(target.address)))];
   const sharedMetadata = await loadSharedMetadata();
   const sharedTokens = targetAddresses.flatMap((address) => {
-    const token = sharedMetadata.get(`${chain}:${address}`);
+    const token = sharedMetadata?.get(`${chain}:${address}`);
     return token ? [token] : [];
   });
   const duneTokens =
-    sharedMetadataPath() === undefined
+    sharedMetadata === null
       ? await loadDuneTokenMetadata({
           chain,
           addresses: targetAddresses,
