@@ -922,29 +922,6 @@ type DailyTotalExportRow = {
   as_of_ts: string;
 };
 
-type DailyAddressFlowExportRow = {
-  network: string;
-  token_address: string;
-  day: string;
-  token_name: string | null;
-  token_symbol: string | null;
-  token_decimals: number | null;
-  target_source: string | null;
-  coingecko_id: string | null;
-  coingecko_name: string | null;
-  coingecko_symbol: string | null;
-  address: string;
-  sent_transfer_count: bigint | number;
-  received_transfer_count: bigint | number;
-  total_transfer_count: bigint | number;
-  sent_amount_native_sum: number;
-  received_amount_native_sum: number;
-  gross_amount_native_sum: number;
-  net_amount_native_sum: number;
-  is_partial_day: boolean;
-  as_of_ts: string;
-};
-
 type LeaderboardExportRow = {
   network: string;
   token_address: string;
@@ -1009,42 +986,6 @@ const dailyTotalsExportSql = ({
     '${escapeSqlString(asOfTs)}' as as_of_ts
   from token_daily_totals as totals
   where ${fullRebuild ? "true" : "exists (select 1 from source_days_tokens as affected where affected.chain = totals.chain and affected.day = totals.day and affected.token_address = totals.token_address)"}
-`;
-
-const dailyAddressFlowsExportSql = ({
-  asOfTs,
-  latestDay,
-  fullRebuild,
-  network,
-}: {
-  asOfTs: string;
-  latestDay: string;
-  fullRebuild: boolean;
-  network: Network;
-}) => `
-  select
-    '${escapeSqlString(network)}' as network,
-    flows.token_address,
-    cast(flows.day as varchar) as day,
-    flows.token_name,
-    flows.token_symbol,
-    flows.token_decimals,
-    flows.target_source,
-    flows.coingecko_id,
-    flows.coingecko_name,
-    flows.coingecko_symbol,
-    flows.address,
-    flows.sent_transfer_count,
-    flows.received_transfer_count,
-    flows.total_transfer_count,
-    flows.sent_amount_native_sum,
-    flows.received_amount_native_sum,
-    flows.gross_amount_native_sum,
-    flows.net_amount_native_sum,
-    flows.day = date '${escapeSqlString(latestDay)}' as is_partial_day,
-    '${escapeSqlString(asOfTs)}' as as_of_ts
-  from token_daily_address_flows as flows
-  where ${fullRebuild ? "true" : "exists (select 1 from source_days_tokens as affected where affected.chain = flows.chain and affected.day = flows.day and affected.token_address = flows.token_address)"}
 `;
 
 const leaderboardExportSql = ({
@@ -1192,14 +1133,14 @@ const deleteAffectedLeaderboardRows = async ({
 const exportToPostgres = async ({
   connection,
   chain,
-  dailyFullRebuild,
+  dailyTotalsFullRebuild,
   leaderboardFullRebuild,
   includeLeaderboards,
   latestDay,
 }: {
   connection: DuckDBConnection;
   chain: Chain;
-  dailyFullRebuild: boolean;
+  dailyTotalsFullRebuild: boolean;
   leaderboardFullRebuild: boolean;
   includeLeaderboards: boolean;
   latestDay: string;
@@ -1218,17 +1159,12 @@ const exportToPostgres = async ({
       : [];
   const client = new Client({ connectionString: databaseUrl });
   let dailyTotalsCount = 0;
-  let dailyAddressFlowsCount = 0;
   let leaderboardCount = 0;
 
   await client.connect();
 
   try {
     await client.query("begin");
-
-    if (dailyFullRebuild) {
-      await client.query("delete from token_daily_address_flows where network = $1", [network]);
-    }
 
     const dailyTotalsColumns = [
       "network",
@@ -1242,7 +1178,7 @@ const exportToPostgres = async ({
     ];
     await streamRows<DailyTotalExportRow>(
       connection,
-      dailyTotalsExportSql({ asOfTs, latestDay, fullRebuild: dailyFullRebuild, network }),
+      dailyTotalsExportSql({ asOfTs, latestDay, fullRebuild: dailyTotalsFullRebuild, network }),
       async (batch) => {
         dailyTotalsCount += batch.length;
         await upsertRowBatch({
@@ -1252,44 +1188,6 @@ const exportToPostgres = async ({
           rows: batch as unknown as Record<string, unknown>[],
           conflict: ["network", "token_address", "day"],
           updates: dailyTotalsColumns.slice(3),
-        });
-      },
-    );
-
-    const dailyAddressFlowColumns = [
-      "network",
-      "token_address",
-      "day",
-      "token_name",
-      "token_symbol",
-      "token_decimals",
-      "target_source",
-      "coingecko_id",
-      "coingecko_name",
-      "coingecko_symbol",
-      "address",
-      "sent_transfer_count",
-      "received_transfer_count",
-      "total_transfer_count",
-      "sent_amount_native_sum",
-      "received_amount_native_sum",
-      "gross_amount_native_sum",
-      "net_amount_native_sum",
-      "is_partial_day",
-      "as_of_ts",
-    ];
-    await streamRows<DailyAddressFlowExportRow>(
-      connection,
-      dailyAddressFlowsExportSql({ asOfTs, latestDay, fullRebuild: dailyFullRebuild, network }),
-      async (batch) => {
-        dailyAddressFlowsCount += batch.length;
-        await upsertRowBatch({
-          client,
-          table: "token_daily_address_flows",
-          columns: dailyAddressFlowColumns,
-          rows: batch as unknown as Record<string, unknown>[],
-          conflict: ["network", "token_address", "day", "address"],
-          updates: dailyAddressFlowColumns.slice(3),
         });
       },
     );
@@ -1347,10 +1245,9 @@ const exportToPostgres = async ({
     logLine("published flows to postgres", {
       chain,
       daily_rows: dailyTotalsCount,
-      daily_address_flow_rows: dailyAddressFlowsCount,
       leaderboard_rows: includeLeaderboards ? leaderboardCount : undefined,
       deferred_leaderboards: includeLeaderboards ? undefined : 1,
-      daily_full_rebuild: dailyFullRebuild ? 1 : undefined,
+      daily_totals_full_rebuild: dailyTotalsFullRebuild ? 1 : undefined,
       leaderboard_full_rebuild: leaderboardFullRebuild ? 1 : undefined,
     });
   } catch (error) {
@@ -1473,7 +1370,7 @@ const syncPass = async ({
       await exportToPostgres({
         connection,
         chain,
-        dailyFullRebuild: true,
+        dailyTotalsFullRebuild: true,
         leaderboardFullRebuild: true,
         includeLeaderboards: true,
         latestDay,
@@ -1541,7 +1438,7 @@ const syncPass = async ({
   await exportToPostgres({
     connection,
     chain,
-    dailyFullRebuild: false,
+    dailyTotalsFullRebuild: false,
     leaderboardFullRebuild,
     includeLeaderboards,
     latestDay,

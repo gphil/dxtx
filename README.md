@@ -202,7 +202,9 @@ Resume is cache-first. The publisher resumes from the last flushed transfer chun
 - When `FLOWS_DATABASE_URL` is set, or when local `DB_*` settings are present, publish compact serving tables to Postgres:
   - `token_flow_daily_totals`
   - `token_flow_leaderboards`
+  - `token_flow_leaderboards_enriched`
   - these serving tables use `network` values aligned with Dexosphere, such as `eth`, `base`, `arbitrum`, and `bsc`
+  - full daily address flows stay in local DuckDB and the raw B2 cache, not serving Postgres
 
 `build:flows` is still useful for ad hoc or bounded historical analysis. `sync:flows` is the long-running production path and uses its own local DuckDB file by default so it does not conflict with the ad hoc analytics database.
 

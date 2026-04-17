@@ -79,36 +79,6 @@ const createServingSchemaSql = `
     primary key (network, token_address, day)
   );
 
-  create table if not exists token_daily_address_flows (
-    network text not null,
-    token_address text not null,
-    day date not null,
-    token_name text,
-    token_symbol text,
-    token_decimals integer,
-    target_source text,
-    coingecko_id text,
-    coingecko_name text,
-    coingecko_symbol text,
-    address text not null,
-    sent_transfer_count bigint not null,
-    received_transfer_count bigint not null,
-    total_transfer_count bigint not null,
-    sent_amount_native_sum double precision not null,
-    received_amount_native_sum double precision not null,
-    gross_amount_native_sum double precision not null,
-    net_amount_native_sum double precision not null,
-    is_partial_day boolean not null,
-    as_of_ts timestamptz not null,
-    primary key (network, token_address, day, address)
-  );
-
-  create index if not exists idx_token_daily_address_flows_lookup
-    on token_daily_address_flows (network, token_address, address, day);
-
-  create index if not exists idx_token_daily_address_flows_coingecko_day
-    on token_daily_address_flows (coingecko_id, day desc);
-
   create table if not exists token_flow_leaderboards (
     network text not null,
     token_address text not null,

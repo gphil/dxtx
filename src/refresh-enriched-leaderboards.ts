@@ -247,16 +247,16 @@ export const refreshEnrichedLeaderboards = async ({
   await client.connect();
 
   try {
-    const hasDailyFlows = await client.query<{ has_rows: boolean }>(`
+    const hasLeaderboards = await client.query<{ has_rows: boolean }>(`
       select exists (
         select 1
-        from token_daily_address_flows
+        from token_flow_leaderboards
         limit 1
       ) as has_rows
     `);
 
-    if (!hasDailyFlows.rows[0]?.has_rows) {
-      logLine("skipped enriched leaderboard refresh", { reason: "token_daily_address_flows_is_empty" });
+    if (!hasLeaderboards.rows[0]?.has_rows) {
+      logLine("skipped enriched leaderboard refresh", { reason: "token_flow_leaderboards_is_empty" });
       return;
     }
 

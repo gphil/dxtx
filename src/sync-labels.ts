@@ -1066,7 +1066,9 @@ const listUnlabeledFlowAddresses = async (client: ReturnType<typeof createServin
   const result = await client.query<{ network: string; address: string }>(`
     with flow_addresses as (
       select distinct network, address
-      from token_daily_address_flows
+      from token_flow_leaderboards
+      where metric in ('net_inflow', 'net_outflow')
+        and address <> $1
     )
     select flow_addresses.network, flow_addresses.address
     from flow_addresses
@@ -1075,7 +1077,7 @@ const listUnlabeledFlowAddresses = async (client: ReturnType<typeof createServin
      and address_labels.address = flow_addresses.address
     where address_labels.address is null
     order by flow_addresses.network, flow_addresses.address
-  `);
+  `, [zeroAddress]);
 
   return result.rows.flatMap((row) => {
     const blockchain = duneBlockchainFromNetwork(row.network);
